@@ -1,0 +1,11 @@
+{
+  "name": "@flowforge/sdk",
+  "version": "0.1.0",
+  "description": "FlowForge TypeScript SDK: define workflows, submit runs, and run workers.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "engines": { "node": ">=20" },
+  "dependencies": { "@flowforge/core": "0.1.0" }
+}
