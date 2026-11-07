@@ -182,7 +182,7 @@ Per-workspace quotas (concurrency, active runs, workflows, versions, active work
 
 ### Migrations
 
-The API applies pending migrations when it starts, over a dedicated connection. Every `flowforge-admin` command except `verify` does the same before it runs. Migrators take a PostgreSQL advisory lock first, so instances that start together migrate one after another and the later ones find nothing pending. The lock needs a real session: behind a transaction-mode pooler, run upgrades over a direct connection, or start one instance first and the rest once it is up.
+The API applies pending migrations when it starts, over a dedicated connection. Every `flowforge-admin` command except `verify` does the same before it runs. Each migrator runs in one transaction that holds a transaction-level PostgreSQL advisory lock, so instances that start together migrate one after another and the later ones find nothing pending. This works over a direct connection and through a transaction-mode pooler alike: the transaction stays on one server connection, and the lock ends with it, including when a migration fails or the process dies. Migrations must therefore be transactional (no `CREATE INDEX CONCURRENTLY`).
 
 Migrations `0003`, `0005`, `0006` and `0007` create indexes inside the migration transaction, not `CONCURRENTLY`, so writes to the indexed tables wait until the migration commits. On a large existing database, upgrade at a quiet time. Do not create these indexes by hand beforehand: the migrations do not use `IF NOT EXISTS` and would fail.
 

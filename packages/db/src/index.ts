@@ -4,7 +4,17 @@ import { Semaphore, guardClient, type DbTimeouts } from "./guard.js";
 import * as schema from "./schema.js";
 
 export * as schema from "./schema.js";
-export { MIGRATIONS_DIR, migrate } from "./migrate.js";
+export {
+  DEFAULT_MIGRATION_LOCK_WAIT_MS,
+  MIGRATIONS_DIR,
+  MIGRATION_LOCK,
+  MigrationFailedError,
+  MigrationLockTimeoutError,
+  migrate,
+  type MigrateOptions,
+  type MigrationLockHolder,
+  type MigrationLog,
+} from "./migrate.js";
 export { redactDbError } from "./redact.js";
 export { DbTimeoutError, Semaphore, classifyDbError, guardClient, type DbTimeoutKind, type DbTimeouts } from "./guard.js";
 

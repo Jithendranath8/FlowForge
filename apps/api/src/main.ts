@@ -36,7 +36,7 @@ const log = pino({
   redact: { paths: ["req.headers.authorization", "req.headers.cookie", "res.headers['set-cookie']"], censor: "[redacted]" },
 });
 
-await migrate(config.DATABASE_URL);
+await migrate(config.DATABASE_URL, { log });
 const handle = connect(config.DATABASE_URL, {
   max: config.DATABASE_POOL_MAX,
   applicationName: "flowforge-api",
