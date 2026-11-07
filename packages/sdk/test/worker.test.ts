@@ -45,7 +45,7 @@ describe("registration", () => {
   it("registers its handler types, queues and capacity, then long-polls with its free capacity", async () => {
     await start({ handlers: { "a.b": () => 1, c: () => 2 }, queues: ["q1"], capabilities: ["gpu"], concurrency: 3, cpu: 6, memoryMb: 900 });
     const [reg] = api.calls("POST", /^\/v1\/workers$/);
-    expect(reg!.body).toMatchObject({ queues: ["q1"], capabilities: ["gpu"], taskTypes: ["a.b", "c"], maxConcurrency: 3, cpu: 6, memoryMb: 900, sdkVersion: "0.1.0" });
+    expect(reg!.body).toMatchObject({ queues: ["q1"], capabilities: ["gpu"], taskTypes: ["a.b", "c"], maxConcurrency: 3, cpu: 6, memoryMb: 900, sdkVersion: "1.0.0" });
     await until(() => api.calls("POST", /\/poll$/).length > 0);
     expect(api.calls("POST", /\/poll$/)[0]!.body).toEqual({ freeSlots: 3, freeCpu: 6, freeMemoryMb: 900, waitMs: 30 });
     expect(worker!.id).toBe("w-1");

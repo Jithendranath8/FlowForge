@@ -198,7 +198,7 @@ export class Worker {
     const body = {
       name: this.opts.name ?? `${hostname()}-${process.pid}`,
       hostname: hostname(),
-      sdkVersion: "0.1.0",
+      sdkVersion: "1.0.0",
       queues: this.opts.queues ?? ["default"],
       capabilities: this.opts.capabilities ?? [],
       taskTypes: Object.keys(this.opts.handlers),

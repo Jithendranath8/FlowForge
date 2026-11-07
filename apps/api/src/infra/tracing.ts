@@ -32,7 +32,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
  * worker and API instance.
  */
 
-const VERSION = "0.1.0";
+const VERSION = "1.0.0";
 export const tracer = trace.getTracer("flowforge-api", VERSION);
 
 export interface TracingOptions {

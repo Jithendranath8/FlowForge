@@ -11,7 +11,7 @@ The SDK is the `@flowforge/sdk` package: ES modules only, Node.js 20.3 or later.
 
 ```json
 {
-  "dependencies": { "@flowforge/sdk": "0.1.0" }
+  "dependencies": { "@flowforge/sdk": "1.0.0" }
 }
 ```
 
@@ -67,7 +67,7 @@ Two read-only properties help with logging and health checks: `worker.id` is the
 | `handleSignals` | `false` | Call `stop()` on the first `SIGTERM` or `SIGINT`. |
 | `logger` | `warn` and `error` to the console, `info` dropped | An object with `info`, `warn` and `error` methods, each called as `(message, data?)`. |
 | `timeoutMs` | `30000` | Timeout for each HTTP request. A poll request uses its wait plus 15,000 ms instead. |
-| `userAgent` | `flowforge-sdk/0.1.0` | `User-Agent` header on every request. |
+| `userAgent` | `flowforge-sdk/1.0.0` | `User-Agent` header on every request. |
 
 Lowering `pollWaitMs` does not make pickup faster: the API answers a poll as soon as a task is available. A lower value only adds requests while the worker is idle.
 

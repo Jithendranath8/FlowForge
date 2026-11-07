@@ -47,7 +47,7 @@ export class HttpClient {
         headers: {
           authorization: `Bearer ${this.opts.apiKey}`,
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
-          "user-agent": this.opts.userAgent ?? "flowforge-sdk/0.1.0",
+          "user-agent": this.opts.userAgent ?? "flowforge-sdk/1.0.0",
           ...extra.headers,
         },
         body: body !== undefined ? JSON.stringify(body) : null,

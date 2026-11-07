@@ -1,6 +1,6 @@
 {
   "name": "@flowforge/example-quickstart",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "FlowForge quickstart: a four-step ETL workflow, a worker, and a run submitter.",
@@ -8,6 +8,6 @@
     "worker": "tsx src/worker.ts",
     "run-workflow": "tsx src/run.ts"
   },
-  "dependencies": { "@flowforge/sdk": "0.1.0" },
+  "dependencies": { "@flowforge/sdk": "1.0.0" },
   "devDependencies": { "tsx": "4.23.15" }
 }
