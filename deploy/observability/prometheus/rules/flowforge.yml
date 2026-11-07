@@ -1,0 +1,125 @@
+# FlowForge alerts (ADR-017). Each alert names its runbook section in docs/OPERATIONS.md.
+# System-state gauges are sampled from Postgres by every instance, so they are
+# aggregated with max(), never sum(). Tested by flowforge.test.yml (promtool test rules).
+groups:
+  - name: flowforge
+    rules:
+      - alert: FlowForgeApiDown
+        expr: up{job="flowforge-api"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "FlowForge API instance {{ $labels.instance }} is not scrapeable"
+          runbook: "docs/OPERATIONS.md#api-down"
+
+      - alert: FlowForgeNoActiveWorkers
+        expr: max(flowforge_tasks{state="queued"}) > 0 and max(flowforge_workers{state="active"}) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Tasks are queued but no worker is active"
+          runbook: "docs/OPERATIONS.md#no-workers"
+
+      - alert: FlowForgeQueueWaitHigh
+        expr: max(flowforge_oldest_queued_task_age_seconds) > 300
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "A task has waited {{ $value | humanizeDuration }} for a worker"
+          runbook: "docs/OPERATIONS.md#queue-wait"
+
+      - alert: FlowForgeLeaseExpiriesHigh
+        expr: |
+          sum(rate(flowforge_task_attempts_total{outcome="lease_expired"}[10m]))
+            / sum(rate(flowforge_task_attempts_total[10m])) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of attempts end in lease expiry (workers crashing or partitioned)"
+          runbook: "docs/OPERATIONS.md#lease-expiries"
+
+      - alert: FlowForgeTaskFailuresHigh
+        expr: |
+          sum(rate(flowforge_task_attempts_total{outcome=~"failed|timed_out"}[10m]))
+            / sum(rate(flowforge_task_attempts_total[10m])) > 0.2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of task attempts fail or time out"
+          runbook: "docs/OPERATIONS.md#task-failures"
+
+      - alert: FlowForgeDatabaseErrors
+        # rate over 1m is non-zero only while errors keep occurring, so "for: 2m" means
+        # requests have been failing for two minutes; a recovered blip never pages.
+        expr: sum(rate(flowforge_http_errors_total{code=~"database_timeout|database_unavailable"}[1m])) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "The API is answering 503 because the database is slow or unreachable"
+          runbook: "docs/OPERATIONS.md#database"
+
+      - alert: FlowForgeDbPoolSaturated
+        expr: max(flowforge_db_pool_waiting) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Queries on {{ $labels.instance }} are waiting for database connections"
+          runbook: "docs/OPERATIONS.md#database"
+
+      - alert: FlowForgeMaintenanceStalled
+        expr: sum(increase(flowforge_background_loop_duration_seconds_count{loop="maintenance"}[3m])) == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "No maintenance tick has completed: expired leases are not being reaped"
+          runbook: "docs/OPERATIONS.md#maintenance"
+
+      - alert: FlowForgeBackgroundLoopFailing
+        # Still failing after 3 minutes; a short outage that recovered does not page after the fact.
+        expr: sum by (loop) (rate(flowforge_background_loop_errors_total[1m])) > 0
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "Background loop {{ $labels.loop }} keeps failing"
+          runbook: "docs/OPERATIONS.md#maintenance"
+
+      - alert: FlowForgeRedisDegraded
+        expr: flowforge_redis_enabled == 1 and flowforge_redis_healthy == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Redis is degraded on {{ $labels.instance }}; workers are polling (work continues, slower)"
+          runbook: "docs/OPERATIONS.md#redis"
+
+      - alert: FlowForgeOutboxBacklog
+        expr: max(flowforge_outbox_oldest_unpublished_age_seconds) > 60
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Wake-ups are {{ $value | humanizeDuration }} behind"
+          runbook: "docs/OPERATIONS.md#redis"
+
+      - alert: FlowForgeClockSyncStale
+        expr: flowforge_clock_since_sync_seconds > 120
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Engine clock on {{ $labels.instance }} has not synced with the database for {{ $value | humanizeDuration }}"
+          runbook: "docs/OPERATIONS.md#clock"
+
+      - alert: FlowForgeStateSamplerStale
+        # Instances with sampling switched off report -1; they must not hide the others.
+        expr: min(flowforge_state_sample_age_seconds >= 0) > 120
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Queue and backlog gauges are stale (no instance can sample Postgres)"
+          runbook: "docs/OPERATIONS.md#maintenance"
+
+      - alert: FlowForgeRetentionBehind
+        expr: max(flowforge_retention_backlog) == 1
+        for: 6h
+        labels: { severity: info }
+        annotations:
+          summary: "Retention has been working through a backlog for 6 hours; raise RETENTION_MAX_BATCHES or check database load"
+          runbook: "docs/OPERATIONS.md#retention"

@@ -1,6 +1,6 @@
 import { schema, type DbHandle } from "@flowforge/db";
 import { and, eq } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { EngineContext } from "../../src/engine/context.js";
 import { claimTasks, completeTask, failTask, renewLeases, saveCheckpoint, type LeasedTask, type WorkerRow } from "../../src/engine/execution.js";
 import { markOfflineWorkers, promoteRetries, reapExpiredLeases, relayOutbox } from "../../src/engine/maintenance.js";
@@ -8,7 +8,7 @@ import { cancelRun, retryTask, submitRun } from "../../src/engine/runs.js";
 import { deregisterWorker, registerWorker, touchWorker } from "../../src/engine/workers.js";
 import { registerWorkflow } from "../../src/engine/workflows.js";
 import { AppError } from "../../src/errors.js";
-import { TestClock, createTenant, makeContext, resetData, setupDatabase } from "./harness.js";
+import { TestClock, createTenant, makeContext, resetData, setupDatabase, timestampsOutside } from "./harness.js";
 
 let h: DbHandle;
 let clock: TestClock;
@@ -26,6 +26,11 @@ beforeEach(async () => {
   clock = new TestClock();
   ctx = makeContext(h, clock);
   tenant = await createTenant(h, "acme");
+});
+// ADR-015: whatever a test did, every timestamp the engine wrote came from its clock
+// (the TestClock starts at 2026-01-01; deadlines and retry times may lie a day ahead).
+afterEach(async () => {
+  expect(await timestampsOutside(h, new Date("2026-01-01T00:00:00.000Z"), new Date(clock.now().getTime() + 86_400_000))).toEqual([]);
 });
 
 const noRetry = { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, backoffCoefficient: 1, jitter: 0 };

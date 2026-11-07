@@ -32,7 +32,12 @@ export class HttpClient {
     this.base = opts.apiUrl.replace(/\/+$/, "");
   }
 
-  async request<T>(method: string, path: string, body?: unknown, extra: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<T> {
+  async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    extra: { signal?: AbortSignal; timeoutMs?: number; headers?: Record<string, string> } = {},
+  ): Promise<T> {
     const timeout = AbortSignal.timeout(extra.timeoutMs ?? this.opts.timeoutMs ?? 30_000);
     const signal = extra.signal ? AbortSignal.any([extra.signal, timeout]) : timeout;
     let res: Response;
@@ -43,6 +48,7 @@ export class HttpClient {
           authorization: `Bearer ${this.opts.apiKey}`,
           ...(body !== undefined ? { "content-type": "application/json" } : {}),
           "user-agent": this.opts.userAgent ?? "flowforge-sdk/0.1.0",
+          ...extra.headers,
         },
         body: body !== undefined ? JSON.stringify(body) : null,
         signal,

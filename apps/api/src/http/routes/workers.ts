@@ -9,6 +9,8 @@ import { CheckpointBody, CompleteBody, FailBody, HeartbeatBody, IdParams, PollBo
 
 /** Worker protocol. Requires an API key with the `worker` scope; everything is tenant-bound. */
 export function workerRoutes(app: FastifyInstance, ctx: EngineContext) {
+  const activePolls = new Map<string, AbortController>();
+
   app.post("/workers", async (req, reply) => {
     const p = requireScope(req, "worker");
     const body = parse(RegisterWorkerBody, req.body);
@@ -37,22 +39,35 @@ export function workerRoutes(app: FastifyInstance, ctx: EngineContext) {
     const p = requireScope(req, "worker");
     const { id } = parse(IdParams, req.params);
     const body = parse(PollBody, req.body);
-    const deadline = Date.now() + body.waitMs;
+    const deadline = performance.now() + body.waitMs; // a duration: monotonic, immune to clock steps
     const abort = new AbortController();
     // The *response* closing before we have written it means the client went away.
     // (IncomingMessage "close" fires as soon as the body is consumed, so it cannot be used.)
     reply.raw.on("close", () => {
       if (!reply.raw.writableEnded) abort.abort();
     });
+    // One in-flight poll per worker id: a newer poll ends the older one's wait. This
+    // bounds a tenant's concurrent long-polls (and, with Redis down, their once-a-second
+    // claim attempts) by its max_active_workers quota instead of its request budget.
+    const pollKey = `${p.tenantId}:${id}`;
+    activePolls.get(pollKey)?.abort();
+    activePolls.set(pollKey, abort);
     let tasks: LeasedTask[];
-    for (;;) {
-      const worker = await touchWorker(ctx, p.tenantId, id, false);
-      tasks = await claimTasks(ctx, worker, body);
-      const remaining = deadline - Date.now();
-      if (tasks.length > 0 || remaining <= 0 || abort.signal.aborted) break;
-      await ctx.notifier.waitForWork(p.tenantId, worker.queues, remaining, abort.signal);
+    try {
+      for (;;) {
+        const worker = await touchWorker(ctx, p.tenantId, id, false);
+        tasks = await claimTasks(ctx, worker, body);
+        const remaining = deadline - performance.now();
+        if (tasks.length > 0 || remaining <= 0 || abort.signal.aborted) break;
+        await ctx.notifier.waitForWork(p.tenantId, worker.queues, remaining, abort.signal);
+      }
+    } finally {
+      if (activePolls.get(pollKey) === abort) activePolls.delete(pollKey);
     }
-    return { tasks };
+    // Deadlines also go out as durations measured on the engine clock at send time, so a
+    // worker never compares the engine's timestamps with its own host clock (ADR-015).
+    const sentAt = ctx.now().getTime();
+    return { tasks: tasks.map((t) => ({ ...t, deadlineInMs: Math.max(0, Date.parse(t.attemptDeadline) - sentAt) })) };
   });
 
   app.post("/workers/:id/deregister", async (req) => {
@@ -122,7 +137,8 @@ export function workerRoutes(app: FastifyInstance, ctx: EngineContext) {
     ]);
     return {
       runs: Object.fromEntries([...runs].map((r) => [r.state, r.n])),
-      queues: [...queues],
+      // Raw SQL returns Postgres's text timestamp; the API speaks ISO 8601.
+      queues: [...queues].map((q) => ({ ...q, oldest: q.oldest ? new Date(q.oldest).toISOString() : null })),
       workers: Object.fromEntries([...workers].map((r) => [r.state, r.n])),
       deadLetters: [...dlq][0]?.n ?? 0,
       generatedAt: ctx.now().toISOString(),

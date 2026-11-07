@@ -33,6 +33,28 @@ describe("compileWorkflow", () => {
     expect(a!.retry.maxAttempts).toBe(3);
   });
 
+  it("applies defaults.queue only to tasks that name no queue; an explicit queue, even \"default\", wins", () => {
+    const r = compileWorkflow({
+      name: "x",
+      defaults: { queue: "batch" },
+      tasks: [
+        { key: "a", type: "t" },
+        { key: "b", type: "t", queue: "default" },
+        { key: "c", type: "t", queue: "gpu" },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(Object.fromEntries(r.workflow.tasks.map((t) => [t.key, t.queue]))).toEqual({ a: "batch", b: "default", c: "gpu" });
+  });
+
+  it("stores a definition without defaults.queue exactly as before (unchanged checksums)", () => {
+    const r = compileWorkflow({ name: "x", tasks: [{ key: "a", type: "t" }, { key: "b", type: "t", queue: "gpu" }] });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.workflow.definition.tasks.map((t) => t.queue)).toEqual(["default", "gpu"]);
+  });
+
   it("rejects duplicate keys, unknown and self dependencies", () => {
     const r = compileWorkflow(
       wf([

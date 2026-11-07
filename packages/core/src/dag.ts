@@ -28,11 +28,24 @@ export type CompileResult =
   | { ok: false; issues: DagIssue[] };
 
 /**
+ * Give tasks that name no queue the workflow's `defaults.queue`, before parsing: once the
+ * schema fills in "default", an omitted queue and an explicit `queue: "default"` would look
+ * the same. Definitions without `defaults.queue` are untouched, so their checksums are too.
+ */
+function withQueueDefault(input: unknown): unknown {
+  if (typeof input !== "object" || input === null) return input;
+  const def = input as { defaults?: { queue?: unknown }; tasks?: unknown };
+  const queue = def.defaults?.queue;
+  if (queue === undefined || !Array.isArray(def.tasks)) return input;
+  return { ...def, tasks: def.tasks.map((t: unknown) => (typeof t === "object" && t !== null && (t as { queue?: unknown }).queue === undefined ? { ...t, queue } : t)) };
+}
+
+/**
  * Validate and compile an untrusted workflow definition. A workflow can only be
  * registered (and therefore executed) if this returns ok.
  */
 export function compileWorkflow(input: unknown): CompileResult {
-  const parsed = WorkflowDefinitionSchema.safeParse(input);
+  const parsed = WorkflowDefinitionSchema.safeParse(withQueueDefault(input));
   if (!parsed.success) {
     return {
       ok: false,

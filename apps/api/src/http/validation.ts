@@ -27,9 +27,16 @@ export const SubmitRunBody = z.object({
 export const ListRunsQuery = z.object({
   state: z.enum(["running", "succeeded", "failed", "cancelled"]).optional(),
   workflow: z.string().max(64).optional(),
+  /** A run id, or the start of an idempotency key. */
+  q: z.string().trim().min(1).max(200).optional(),
+  /** By creation time. */
+  order: z.enum(["desc", "asc"]).default("desc"),
   limit: z.coerce.number().int().min(1).max(100).default(25),
   cursor: z.string().max(200).optional(),
 });
+
+/** Escape LIKE wildcards so user text matches literally. */
+export const likePrefix = (s: string) => `${s.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
 
 export const EventsQuery = z.object({
   after: z.coerce.number().int().min(0).default(0),

@@ -7,9 +7,19 @@ import type { Logger } from "pino";
  * If Redis is absent or down, waits fall back to short polling intervals, so delivery
  * latency degrades but correctness does not.
  */
+export interface NotifierHealth {
+  status: "not_configured" | "ok" | "degraded";
+  /** Last successful round-trip (health ping or publish), ISO time. */
+  lastOkAt: string | null;
+  lastError: string | null;
+  consecutiveFailures: number;
+}
+
 export interface Notifier {
   readonly enabled: boolean;
+  /** True only if both connections are up and a round-trip succeeded recently. */
   healthy(): boolean;
+  health(): NotifierHealth;
   publishEvents(rows: { tenantId: string; payload: { type: string; data: Record<string, unknown> } }[]): Promise<void>;
   /** Resolve when work may be available on one of the queues, or after timeoutMs. */
   waitForWork(tenantId: string, queues: string[], timeoutMs: number, signal?: AbortSignal): Promise<void>;
@@ -42,6 +52,9 @@ export class NullNotifier implements Notifier {
   healthy() {
     return false;
   }
+  health(): NotifierHealth {
+    return { status: "not_configured", lastOkAt: null, lastError: null, consecutiveFailures: 0 };
+  }
   async publishEvents() {}
   waitForWork(_t: string, _q: string[], timeoutMs: number, signal?: AbortSignal) {
     return sleep(Math.min(timeoutMs, FALLBACK_POLL_MS), signal);
@@ -52,41 +65,109 @@ export class NullNotifier implements Notifier {
   async close() {}
 }
 
+export interface RedisNotifierOptions {
+  /** Per-command deadline. A hung server fails commands instead of blocking callers. */
+  commandTimeoutMs: number;
+  /** How often both connections are PINGed to keep `healthy()` truthful. */
+  healthIntervalMs: number;
+}
+
+export const DEFAULT_REDIS_OPTIONS: RedisNotifierOptions = { commandTimeoutMs: 1_000, healthIntervalMs: 1_000 };
+
 export class RedisNotifier implements Notifier {
   readonly enabled = true;
   private readonly pub: Redis;
   private readonly sub: Redis;
   private readonly waiters = new Map<string, Set<() => void>>();
   private readonly listeners = new Map<string, Set<(e: unknown) => void>>();
+  private readonly prober: NodeJS.Timeout;
+  private probing = false;
+  private lastOkAt: number | null = null;
+  private lastError: string | null = null;
+  private consecutiveFailures = 0;
 
   constructor(
     url: string,
     private readonly log: Logger,
+    private readonly opts: RedisNotifierOptions = DEFAULT_REDIS_OPTIONS,
   ) {
-    const opts = {
+    const clientOpts = {
       maxRetriesPerRequest: 1,
       enableOfflineQueue: false,
       connectTimeout: 5_000,
+      commandTimeout: opts.commandTimeoutMs,
       retryStrategy: (n: number) => Math.min(n * 200, 5_000),
     };
-    this.pub = new Redis(url, opts);
+    this.pub = new Redis(url, clientOpts);
     // The subscriber queues its psubscribe until connected and re-subscribes on reconnect.
-    this.sub = new Redis(url, { ...opts, enableOfflineQueue: true });
+    this.sub = new Redis(url, { ...clientOpts, enableOfflineQueue: true });
     for (const [name, c] of [
       ["pub", this.pub],
       ["sub", this.sub],
     ] as const) {
       c.on("error", (err: Error) => this.log.warn({ err: err.message, client: name }, "redis error"));
+      c.on("ready", () => void this.probe());
     }
     void this.sub.psubscribe("ff:t:*").catch((err: Error) => this.log.warn({ err: err.message }, "redis psubscribe failed"));
     this.sub.on("pmessage", (_pattern: string, channel: string, message: string) => this.dispatch(channel, message));
+    this.prober = setInterval(() => void this.probe(), opts.healthIntervalMs);
+    this.prober.unref();
   }
 
+  /**
+   * Socket state alone is not enough: a hung server keeps its sockets "ready" while every
+   * command stalls. Health therefore also requires a recent successful round-trip and no
+   * failure since.
+   */
   healthy(): boolean {
-    return this.pub.status === "ready" && this.sub.status === "ready";
+    if (this.pub.status !== "ready" || this.sub.status !== "ready") return false;
+    if (this.consecutiveFailures > 0 || this.lastOkAt === null) return false;
+    return Date.now() - this.lastOkAt <= this.opts.healthIntervalMs * 3 + this.opts.commandTimeoutMs;
+  }
+
+  health(): NotifierHealth {
+    return {
+      status: this.healthy() ? "ok" : "degraded",
+      lastOkAt: this.lastOkAt === null ? null : new Date(this.lastOkAt).toISOString(),
+      lastError: this.lastError,
+      consecutiveFailures: this.consecutiveFailures,
+    };
+  }
+
+  private async probe(): Promise<void> {
+    if (this.probing) return;
+    this.probing = true;
+    try {
+      await Promise.all([this.pub.ping(), this.sub.ping()]);
+      this.markOk();
+    } catch (err) {
+      this.markFailure(err);
+    } finally {
+      this.probing = false;
+    }
+  }
+
+  private markOk() {
+    this.lastOkAt = Date.now();
+    this.consecutiveFailures = 0;
+  }
+
+  private markFailure(err: unknown) {
+    this.consecutiveFailures += 1;
+    this.lastError = err instanceof Error ? err.message : String(err);
   }
 
   async publishEvents(rows: Parameters<Notifier["publishEvents"]>[0]): Promise<void> {
+    try {
+      await this.publishPipeline(rows);
+      this.markOk();
+    } catch (err) {
+      this.markFailure(err);
+      throw err;
+    }
+  }
+
+  private async publishPipeline(rows: Parameters<Notifier["publishEvents"]>[0]): Promise<void> {
     const pipeline = this.pub.pipeline();
     const woken = new Set<string>();
     for (const r of rows) {
@@ -154,12 +235,13 @@ export class RedisNotifier implements Notifier {
   }
 
   async close(): Promise<void> {
+    clearInterval(this.prober);
     for (const set of this.waiters.values()) for (const wake of [...set]) wake();
     this.pub.disconnect();
     this.sub.disconnect();
   }
 }
 
-export function createNotifier(url: string | undefined, log: Logger): Notifier {
-  return url ? new RedisNotifier(url, log) : new NullNotifier();
+export function createNotifier(url: string | undefined, log: Logger, opts: RedisNotifierOptions = DEFAULT_REDIS_OPTIONS): Notifier {
+  return url ? new RedisNotifier(url, log, opts) : new NullNotifier();
 }

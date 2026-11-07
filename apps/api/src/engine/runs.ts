@@ -12,6 +12,8 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { badRequest, conflict, notFound } from "../errors.js";
 import type { EngineContext, Tx } from "./context.js";
 import { recordEvents, type EventInput } from "./history.js";
+import { currentTraceparent, withSpan } from "../infra/tracing.js";
+import { countActiveRuns, lockTenant, quotaExceeded } from "./quotas.js";
 import { loadVersion } from "./workflows.js";
 
 /*
@@ -42,14 +44,37 @@ export interface SubmitRunInput {
   triggeredBy: string;
 }
 
-export async function submitRun(
-  ctx: EngineContext,
-  tenantId: string,
-  req: SubmitRunInput,
-): Promise<{ run: RunRow; created: boolean }> {
+export function submitRun(ctx: EngineContext, tenantId: string, req: SubmitRunInput): Promise<{ run: RunRow; created: boolean }> {
+  return withSpan("flowforge.submit_run", { "flowforge.tenant_id": tenantId, "flowforge.workflow": req.workflow }, async (span) => {
+    // The run's trace is this span's: later work on the run joins it (ADR-017).
+    const r = await submitRunTx(ctx, tenantId, req, currentTraceparent());
+    span.setAttributes({ "flowforge.run_id": r.run.id, "flowforge.run.created": r.created });
+    return r;
+  });
+}
+
+async function submitRunTx(ctx: EngineContext, tenantId: string, req: SubmitRunInput, traceContext: string | null): Promise<{ run: RunRow; created: boolean }> {
   const v = await loadVersion(ctx, tenantId, req.workflow, req.version);
   const now = ctx.now();
   return ctx.db.transaction(async (tx) => {
+    const tenant = await lockTenant(tx, tenantId);
+    // A repeated idempotency key returns the original run and consumes no quota.
+    if (req.idempotencyKey) {
+      const [existing] = await tx
+        .select()
+        .from(schema.workflowRuns)
+        .where(
+          and(
+            eq(schema.workflowRuns.tenantId, tenantId),
+            eq(schema.workflowRuns.workflowId, v.workflowId),
+            eq(schema.workflowRuns.idempotencyKey, req.idempotencyKey),
+          ),
+        );
+      if (existing) return { run: existing, created: false };
+    }
+    const active = await countActiveRuns(tx, tenantId);
+    if (active >= tenant.maxActiveRuns) throw quotaExceeded("max_active_runs", tenant.maxActiveRuns, active);
+
     const [inserted] = await tx
       .insert(schema.workflowRuns)
       .values({
@@ -62,6 +87,7 @@ export async function submitRun(
         priority: req.priority ?? 0,
         triggeredBy: req.triggeredBy,
         createdAt: now,
+        traceContext,
       })
       .onConflictDoNothing({
         target: [schema.workflowRuns.tenantId, schema.workflowRuns.workflowId, schema.workflowRuns.idempotencyKey],
@@ -103,7 +129,7 @@ export async function submitRun(
         createdAt: now,
       })),
     );
-    await recordEvents(tx, [
+    await recordEvents(tx, now, [
       {
         tenantId,
         runId: inserted.id,
@@ -175,9 +201,9 @@ export async function advanceRun(tx: Tx, run: RunRow, now: Date): Promise<void> 
   if (outcome) {
     assertRunTransition(run.state as RunState, outcome);
     await tx.update(schema.workflowRuns).set({ state: outcome, finishedAt: now }).where(eq(schema.workflowRuns.id, run.id));
-    events.push({ tenantId: run.tenantId, runId: run.id, type: `run.${outcome}` });
+    events.push({ tenantId: run.tenantId, runId: run.id, type: `run.${outcome}`, data: { durationMs: Math.max(0, now.getTime() - run.createdAt.getTime()) } });
   }
-  await recordEvents(tx, events);
+  await recordEvents(tx, now, events);
 }
 
 /**
@@ -214,9 +240,9 @@ export async function cancelRun(ctx: EngineContext, tenantId: string, runId: str
       .set({ state: "cancelled", cancelledAt: now, finishedAt: now })
       .where(eq(schema.workflowRuns.id, runId))
       .returning();
-    await recordEvents(tx, [
+    await recordEvents(tx, now, [
       ...active.map((t) => ({ tenantId, runId, taskId: t.id, type: "task.cancelled" as const, data: { key: t.key, from: t.state } })),
-      { tenantId, runId, type: "run.cancelled", data: { by } },
+      { tenantId, runId, type: "run.cancelled", data: { by, durationMs: Math.max(0, now.getTime() - run.createdAt.getTime()) } },
     ]);
     return updated!;
   });
@@ -285,7 +311,7 @@ export async function retryTask(ctx: EngineContext, tenantId: string, taskId: st
       .update(schema.deadLetters)
       .set({ resolvedAt: now, resolution: "retried" })
       .where(and(eq(schema.deadLetters.taskId, taskId), sql`${schema.deadLetters.resolvedAt} is null`));
-    await recordEvents(tx, events);
+    await recordEvents(tx, now, events);
     await advanceRun(tx, run, now);
     return updated!;
   });

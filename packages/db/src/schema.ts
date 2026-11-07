@@ -57,7 +57,16 @@ export const tenants = pgTable("tenants", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
+  // Quotas. Enforced under a tenant row lock (see ADR-013), so concurrent requests
+  // cannot overshoot them. Change with `flowforge-admin set-quota`.
+  /** Max tasks running at once across the tenant. */
   maxConcurrency: integer("max_concurrency").notNull().default(256),
+  /** Max workflow runs in state `running`. */
+  maxActiveRuns: integer("max_active_runs").notNull().default(500),
+  maxWorkflows: integer("max_workflows").notNull().default(200),
+  maxVersionsPerWorkflow: integer("max_versions_per_workflow").notNull().default(200),
+  /** Max registered workers not marked offline. */
+  maxActiveWorkers: integer("max_active_workers").notNull().default(100),
   createdAt: createdAt(),
 });
 
@@ -70,7 +79,9 @@ export const users = pgTable(
     avatarUrl: text("avatar_url"),
     createdAt: createdAt(),
   },
-  (t) => [index("users_email_idx").on(t.email)],
+  // One user per email (case-insensitive): sign-in links identities by verified email,
+  // and concurrent first sign-ins must not create two users (ADR-018).
+  (t) => [uniqueIndex("users_email_lower_uq").on(sql`lower(${t.email})`)],
 );
 
 export const oauthAccounts = pgTable(
@@ -194,6 +205,8 @@ export const workflowRuns = pgTable(
     finishedAt: ts("finished_at"),
     cancelledAt: ts("cancelled_at"),
     triggeredBy: text("triggered_by").notNull(),
+    /** W3C traceparent active when the run was created: the run's trace (ADR-017). Null with tracing off. */
+    traceContext: text("trace_context"),
   },
   (t) => [
     foreignKey({ columns: [t.tenantId, t.workflowId], foreignColumns: [workflows.tenantId, workflows.id] }).onDelete("cascade"),
@@ -204,6 +217,8 @@ export const workflowRuns = pgTable(
       .where(sql`${t.idempotencyKey} is not null`),
     index("workflow_runs_tenant_created_idx").on(t.tenantId, t.createdAt.desc()),
     index("workflow_runs_tenant_state_idx").on(t.tenantId, t.state),
+    // Retention: finished runs, oldest first (ADR-016).
+    index("workflow_runs_finished_idx").on(t.finishedAt).where(sql`${t.finishedAt} is not null`),
   ],
 );
 
@@ -252,6 +267,8 @@ export const tasks = pgTable(
     index("tasks_claim_idx")
       .on(t.tenantId, t.queue, t.priority.desc(), t.enqueuedAt)
       .where(sql`${t.state} = 'queued'`),
+    // The claim's longest-waiting lane (apps/api/src/engine/execution.ts).
+    index("tasks_aging_idx").on(t.tenantId, t.enqueuedAt).where(sql`${t.state} = 'queued'`),
     index("tasks_lease_idx").on(t.leaseExpiresAt).where(sql`${t.state} = 'running'`),
     index("tasks_retry_idx").on(t.availableAt).where(sql`${t.state} = 'retry_scheduled'`),
     index("tasks_run_idx").on(t.runId),
@@ -279,6 +296,8 @@ export const taskAttempts = pgTable(
     foreignKey({ columns: [t.tenantId, t.taskId], foreignColumns: [tasks.tenantId, tasks.id] }).onDelete("cascade"),
     unique("task_attempts_task_attempt_uq").on(t.taskId, t.attempt),
     index("task_attempts_worker_idx").on(t.workerId, t.startedAt.desc()),
+    // Dashboard throughput over time (GET /v1/stats/timeseries).
+    index("task_attempts_tenant_finished_idx").on(t.tenantId, t.finishedAt).where(sql`${t.finishedAt} is not null`),
   ],
 );
 
@@ -300,6 +319,8 @@ export const deadLetters = pgTable(
   (t) => [
     foreignKey({ columns: [t.tenantId, t.taskId], foreignColumns: [tasks.tenantId, tasks.id] }).onDelete("cascade"),
     index("dead_letters_open_idx").on(t.tenantId, t.createdAt.desc()).where(sql`${t.resolvedAt} is null`),
+    // Serves the cascade from tasks when retention deletes runs.
+    index("dead_letters_task_idx").on(t.taskId),
   ],
 );
 
@@ -360,8 +381,13 @@ export const outbox = pgTable(
     payload: jsonb("payload").notNull(),
     createdAt: createdAt(),
     publishedAt: ts("published_at"),
+    /**
+     * A relay claims rows by setting this, then publishes with no transaction open. A
+     * relay that dies mid-publish leaves rows reclaimable once the claim lapses.
+     */
+    relayClaimedUntil: ts("relay_claimed_until"),
   },
-  (t) => [index("outbox_unpublished_idx").on(t.id).where(sql`${t.publishedAt} is null`)],
+  (t) => [index("outbox_unpublished_idx").on(t.id).where(sql`${t.publishedAt} is null`), index("outbox_created_idx").on(t.createdAt)],
 );
 
 // ---------------------------------------------------------------- scheduling intelligence
@@ -399,5 +425,5 @@ export const schedulingDecisions = pgTable(
     modelVersion: text("model_version"),
     createdAt: createdAt(),
   },
-  (t) => [index("scheduling_decisions_tenant_idx").on(t.tenantId, t.id.desc())],
+  (t) => [index("scheduling_decisions_tenant_idx").on(t.tenantId, t.id.desc()), index("scheduling_decisions_created_idx").on(t.createdAt)],
 );

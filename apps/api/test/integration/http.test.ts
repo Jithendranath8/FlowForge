@@ -198,7 +198,7 @@ describe("long-poll over a real socket", () => {
 describe("operational endpoints", () => {
   it("serves health/readiness and refuses disallowed origins for writes", async () => {
     expect((await call("GET", "/health")).json()).toEqual({ status: "ok" });
-    expect((await call("GET", "/ready")).json()).toEqual({ database: "ok", redis: "not_configured" });
+    expect((await call("GET", "/ready")).json()).toEqual({ status: "ready", database: "ok", redis: "not_configured" });
     const cross = await call("PUT", "/v1/workflows", keys.admin, definition, { origin: "https://evil.example" });
     expect(cross.statusCode).toBe(403);
     const allowed = await call("GET", "/v1/workflows", keys.reader, undefined, { origin: "http://localhost:3000" });

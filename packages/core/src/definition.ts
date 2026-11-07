@@ -57,7 +57,8 @@ export const DEFAULT_QUEUE = "default";
  * Trigger rules decide when a task becomes runnable once its dependencies are
  * terminal. They are the supported form of conditional execution.
  *  - all_succeeded: every dependency succeeded (default). Otherwise skipped.
- *  - all_done: every dependency reached any terminal state.
+ *  - all_done: every dependency reached a terminal state, none of them cancelled
+ *    (a cancelled dependency skips it; tasks are only cancelled with their run).
  *  - any_failed: at least one dependency failed (compensation / alerting tasks).
  */
 export const TriggerRule = z.enum(["all_succeeded", "all_done", "any_failed"]);
@@ -81,7 +82,7 @@ export const TaskDefinitionSchema = z.object({
   triggerRule: TriggerRule.default("all_succeeded"),
   resources: ResourceRequestSchema.optional(),
   requiredCapabilities: z.array(Capability).max(16).default([]),
-  /** Static input merged under the run input at execution time. */
+  /** Static input. Handlers receive it as `input`, separately from the run's `runInput` (not merged). */
   input: z.record(z.string(), z.unknown()).optional(),
 });
 export type TaskDefinitionInput = z.input<typeof TaskDefinitionSchema>;
@@ -124,7 +125,8 @@ export function resolveTask(def: WorkflowDefinition, task: TaskDefinition): Reso
     key: task.key,
     type: task.type,
     dependsOn: [...new Set(task.dependsOn)],
-    queue: task.queue !== DEFAULT_QUEUE ? task.queue : (def.defaults.queue ?? DEFAULT_QUEUE),
+    // compileWorkflow already gave tasks without a queue the workflow's defaults.queue.
+    queue: task.queue,
     priority: task.priority,
     retry: task.retry ?? def.defaults.retry ?? DEFAULT_RETRY_POLICY,
     timeoutMs: task.timeoutMs ?? def.defaults.timeoutMs ?? DEFAULT_TIMEOUT_MS,

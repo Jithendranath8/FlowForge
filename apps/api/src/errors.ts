@@ -5,11 +5,16 @@ export class AppError extends Error {
     readonly code: string,
     message: string,
     readonly details?: unknown,
+    /** Response headers to send with the error (e.g. Retry-After). */
+    readonly headers?: Record<string, string>,
   ) {
     super(message);
     this.name = "AppError";
   }
 }
+
+export const rateLimited = (code: string, message: string, retryAfterMs: number, details?: unknown) =>
+  new AppError(429, code, message, details, { "retry-after": String(Math.max(1, Math.ceil(retryAfterMs / 1000))) });
 
 export const notFound = (what: string) => new AppError(404, "not_found", `${what} not found`);
 export const conflict = (code: string, message: string, details?: unknown) => new AppError(409, code, message, details);

@@ -1,0 +1,172 @@
+# promtool test rules flowforge.test.yml  (see docs/OPERATIONS.md#alerts)
+rule_files:
+  - flowforge.yml
+# Evaluated every 15 s, as in production (5 s there): with 1-minute evaluations a
+# short-lived firing window can fall between two evaluations and go untested.
+evaluation_interval: 15s
+
+tests:
+  - name: queued work with no active worker pages; a draining fleet alone does not
+    interval: 1m
+    input_series:
+      - series: 'flowforge_tasks{state="queued",instance="a"}'
+        values: "5x10"
+      - series: 'flowforge_tasks{state="queued",instance="b"}'
+        values: "5x10"
+      - series: 'flowforge_workers{state="active",instance="a"}'
+        values: "1 1 0x8"
+      - series: 'flowforge_workers{state="active",instance="b"}'
+        values: "1 1 0x8"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FlowForgeNoActiveWorkers
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: FlowForgeNoActiveWorkers
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: "Tasks are queued but no worker is active"
+              runbook: "docs/OPERATIONS.md#no-workers"
+
+  - name: lease expiry ratio above 5% for 10 minutes
+    interval: 1m
+    input_series:
+      # 90 attempts/min succeed, 10/min expire: 10%.
+      - series: 'flowforge_task_attempts_total{outcome="succeeded",instance="a"}'
+        values: "0+90x30"
+      - series: 'flowforge_task_attempts_total{outcome="lease_expired",instance="a"}'
+        values: "0+10x30"
+    alert_rule_test:
+      # The ratio is above 5% from the first minute; "for: 10m" holds it pending until ~11m.
+      - eval_time: 8m
+        alertname: FlowForgeLeaseExpiriesHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: FlowForgeLeaseExpiriesHigh
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "10% of attempts end in lease expiry (workers crashing or partitioned)"
+              runbook: "docs/OPERATIONS.md#lease-expiries"
+
+  - name: healthy failure ratio does not alert
+    interval: 1m
+    input_series:
+      - series: 'flowforge_task_attempts_total{outcome="succeeded",instance="a"}'
+        values: "0+99x30"
+      - series: 'flowforge_task_attempts_total{outcome="failed",instance="a"}'
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: FlowForgeTaskFailuresHigh
+        exp_alerts: []
+
+  - name: maintenance stalls when no instance completes a tick
+    interval: 1m
+    input_series:
+      - series: 'flowforge_background_loop_duration_seconds_count{loop="maintenance",instance="a"}'
+        values: "0+60x5 300x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FlowForgeMaintenanceStalled
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: FlowForgeMaintenanceStalled
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: "No maintenance tick has completed: expired leases are not being reaped"
+              runbook: "docs/OPERATIONS.md#maintenance"
+
+  # 15-second samples, like a real scrape: the windows below depend on sample density.
+  - name: ongoing database 503s page after two minutes
+    interval: 15s
+    input_series:
+      - series: 'flowforge_http_errors_total{code="database_timeout",instance="a"}'
+        values: "0x8 0+2x40"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: FlowForgeDatabaseErrors
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: FlowForgeDatabaseErrors
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: "The API is answering 503 because the database is slow or unreachable"
+              runbook: "docs/OPERATIONS.md#database"
+
+  - name: redis degraded only when redis is configured
+    interval: 1m
+    input_series:
+      - series: 'flowforge_redis_enabled{instance="a"}'
+        values: "1x10"
+      - series: 'flowforge_redis_healthy{instance="a"}'
+        values: "1 0x9"
+      - series: 'flowforge_redis_enabled{instance="b"}'
+        values: "0x10"
+      - series: 'flowforge_redis_healthy{instance="b"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: FlowForgeRedisDegraded
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: a }
+            exp_annotations:
+              summary: "Redis is degraded on a; workers are polling (work continues, slower)"
+              runbook: "docs/OPERATIONS.md#redis"
+
+  - name: a background loop that recovered does not page after the fact; one still failing does
+    interval: 15s
+    input_series:
+      # Failing for 105 s (as in the outage observed on 2026-11-06), then healthy.
+      - series: 'flowforge_background_loop_errors_total{loop="maintenance",instance="a"}'
+        values: "0x4 0+3x7 21x40"
+      # Failing continuously.
+      - series: 'flowforge_background_loop_errors_total{loop="outbox-relay",instance="a"}'
+        values: "0+3x60"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FlowForgeBackgroundLoopFailing
+        exp_alerts:
+          - exp_labels: { severity: warning, loop: outbox-relay }
+            exp_annotations:
+              summary: "Background loop outbox-relay keeps failing"
+              runbook: "docs/OPERATIONS.md#maintenance"
+
+  - name: a database blip that recovered does not page
+    interval: 15s
+    input_series:
+      - series: 'flowforge_http_errors_total{code="database_unavailable",instance="b"}'
+        values: "0x8 3x40"
+    alert_rule_test:
+      # A rule that kept the burst in view for 2 minutes (increase[2m], for 1m) fires
+      # from 3m15s to 3m45s; this one must not.
+      - eval_time: 3m30s
+        alertname: FlowForgeDatabaseErrors
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: FlowForgeDatabaseErrors
+        exp_alerts: []
+
+  - name: stale state sampling fires even when another instance has sampling switched off
+    interval: 1m
+    input_series:
+      # Instance a runs with METRICS_STATE_INTERVAL_MS=0 and always reports -1.
+      - series: 'flowforge_state_sample_age_seconds{instance="a"}'
+        values: "-1x15"
+      # Instance b samples, then cannot reach Postgres from minute 1: its age keeps growing.
+      - series: 'flowforge_state_sample_age_seconds{instance="b"}'
+        values: "5 0+60x14"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: FlowForgeStateSamplerStale
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: FlowForgeStateSamplerStale
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Queue and backlog gauges are stale (no instance can sample Postgres)"
+              runbook: "docs/OPERATIONS.md#maintenance"

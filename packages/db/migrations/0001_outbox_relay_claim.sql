@@ -1,0 +1,1 @@
+ALTER TABLE "outbox" ADD COLUMN "relay_claimed_until" timestamp with time zone;

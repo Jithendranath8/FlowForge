@@ -26,6 +26,43 @@ export async function resetData(h: DbHandle): Promise<void> {
   );
 }
 
+/** Timestamp columns filled by fixtures and operators (database clock), not by the engine. */
+const OUT_OF_BAND_COLUMNS = new Set([
+  "tenants.created_at",
+  "users.created_at",
+  "oauth_accounts.created_at",
+  "memberships.created_at",
+  "sessions.created_at",
+  "sessions.expires_at",
+  "sessions.last_seen_at",
+  "api_keys.created_at",
+  "api_keys.expires_at",
+  "api_keys.revoked_at",
+]);
+
+/**
+ * ADR-015 invariant: every timestamp the engine writes comes from ctx.now(). Returns the
+ * engine-written timestamptz columns holding values outside [from, to], which must be
+ * the range of the engine clock the test used. Every timestamptz column in the schema
+ * is checked, so a column added later is covered automatically.
+ */
+export async function timestampsOutside(h: DbHandle, from: Date, to: Date): Promise<string[]> {
+  const cols = await h.sql<{ table_name: string; column_name: string }[]>`
+    select table_name, column_name from information_schema.columns
+    where table_schema = 'public' and data_type = 'timestamp with time zone' order by 1, 2`;
+  const bad: string[] = [];
+  for (const { table_name: t, column_name: c } of cols) {
+    if (OUT_OF_BAND_COLUMNS.has(`${t}.${c}`)) continue;
+    const [r] = await h.sql.unsafe<{ n: number; lo: string | null; hi: string | null }[]>(
+      `select count(*)::int as n, min("${c}")::text as lo, max("${c}")::text as hi from "${t}"
+       where "${c}" < $1::timestamptz or "${c}" > $2::timestamptz`,
+      [from.toISOString(), to.toISOString()],
+    );
+    if (r!.n > 0) bad.push(`${t}.${c}: ${r!.n} row(s) in [${r!.lo}, ${r!.hi}]`);
+  }
+  return bad;
+}
+
 export class TestClock {
   t = new Date("2026-01-01T00:00:00.000Z");
   now = () => new Date(this.t);

@@ -4,6 +4,7 @@ import { conflict, notFound } from "../errors.js";
 import type { EngineContext } from "./context.js";
 import { failAttempt, type WorkerRow } from "./execution.js";
 import { recordEvents } from "./history.js";
+import { countActiveWorkers, lockTenant, quotaExceeded } from "./quotas.js";
 import { lockRun } from "./runs.js";
 
 export interface RegisterWorkerInput {
@@ -21,11 +22,14 @@ export interface RegisterWorkerInput {
 export async function registerWorker(ctx: EngineContext, tenantId: string, input: RegisterWorkerInput) {
   const now = ctx.now();
   return ctx.db.transaction(async (tx) => {
+    const tenant = await lockTenant(tx, tenantId);
+    const active = await countActiveWorkers(tx, tenantId);
+    if (active >= tenant.maxActiveWorkers) throw quotaExceeded("max_active_workers", tenant.maxActiveWorkers, active);
     const [w] = await tx
       .insert(schema.workers)
       .values({ tenantId, ...input, hostname: input.hostname ?? null, sdkVersion: input.sdkVersion ?? null, registeredAt: now, lastHeartbeatAt: now })
       .returning();
-    await recordEvents(tx, [{ tenantId, type: "worker.registered", data: { workerId: w!.id, name: input.name, queues: input.queues } }]);
+    await recordEvents(tx, now, [{ tenantId, type: "worker.registered", data: { workerId: w!.id, name: input.name, queues: input.queues } }]);
     return w!;
   });
 }
@@ -81,7 +85,7 @@ export async function deregisterWorker(ctx: EngineContext, tenantId: string, wor
   }
   await ctx.db.transaction(async (tx) => {
     await tx.update(schema.workers).set({ state: "offline", stoppedAt: now }).where(eq(schema.workers.id, workerId));
-    await recordEvents(tx, [{ tenantId, type: "worker.deregistered", data: { workerId, released } }]);
+    await recordEvents(tx, now, [{ tenantId, type: "worker.deregistered", data: { workerId, released } }]);
   });
   return { released };
 }

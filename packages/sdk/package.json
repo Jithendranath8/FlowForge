@@ -6,6 +6,6 @@
   "license": "Apache-2.0",
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
   "files": ["dist"],
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=20.3" },
   "dependencies": { "@flowforge/core": "0.1.0" }
 }

@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the workflow only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22.23.3"
+
+jobs:
+  checks:
+    name: Build, typecheck, lint, unit tests, audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # Actions are pinned to full commit SHAs (tags are mutable).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install (lockfile only)
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Typecheck (sources and tests)
+        run: npm run typecheck
+      - name: Lint
+        run: npx eslint . --max-warnings=0
+      - name: Unit tests
+        run: npx vitest run --project unit
+      - name: Web app tests (components, hooks, docs content and links)
+        run: npx vitest run --project web
+      - name: Web app production build
+        run: npm run build -w @flowforge/web
+      - name: Dependency audit (production dependencies)
+        run: npm audit --omit=dev --audit-level=low
+      # Alert rules and their unit tests (docs/OPERATIONS.md#alerts). Image pinned by digest (v3.15.1).
+      - name: Prometheus config, alert rules and rule tests
+        run: |
+          IMG=prom/prometheus@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+          R="$PWD/deploy/observability/prometheus"
+          docker run --rm -v "$R/prometheus.yml:/etc/prometheus/prometheus.yml:ro" -v "$R/rules:/etc/prometheus/rules:ro" --entrypoint promtool "$IMG" check config /etc/prometheus/prometheus.yml
+          docker run --rm -v "$R/rules:/r:ro" -w /r --entrypoint promtool "$IMG" test rules flowforge.test.yml
+          node -e 'JSON.parse(require("fs").readFileSync("deploy/observability/grafana/dashboards/flowforge-overview.json", "utf8"))'
+
+  integration:
+    name: Integration, e2e and chaos tests with coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: flowforge
+          POSTGRES_PASSWORD: flowforge_ci_only
+          POSTGRES_DB: flowforge
+        ports: ["54329:5432"]
+        options: >-
+          --health-cmd "pg_isready -U flowforge -d flowforge"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ["63799:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      TEST_ADMIN_DATABASE_URL: postgres://flowforge:flowforge_ci_only@127.0.0.1:54329/flowforge
+      TEST_REDIS_URL: redis://127.0.0.1:63799/15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Install (lockfile only)
+        run: npm ci
+      - name: Build (the e2e and chaos tests run the built API and SDK as processes)
+        run: npm run build
+      - name: All tests with coverage (fails below the thresholds in vitest.config.ts)
+        run: npx vitest run --coverage
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e '
+              const t = require("./coverage/coverage-summary.json").total;
+              const row = (k) => `| ${k} | ${t[k].pct}% | ${t[k].covered}/${t[k].total} |`;
+              console.log(["### Coverage", "", "| Metric | % | Covered |", "|---|---:|---:|", ...["statements", "branches", "functions", "lines"].map(row)].join("\n"));
+            ' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 14
+          if-no-files-found: warn

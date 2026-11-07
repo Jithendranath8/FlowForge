@@ -14,9 +14,18 @@ import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import { AppError, conflict, notFound } from "../errors.js";
 import type { Advice, EngineContext, Tx } from "./context.js";
 import { recordEvents } from "./history.js";
+import { annotateRun, linkTo, withSpan } from "../infra/tracing.js";
+import { countRunningTasks, lockTenant } from "./quotas.js";
 import { advanceRun, lockRun, type RunRow, type TaskRow } from "./runs.js";
 
-const CANDIDATE_WINDOW = 200;
+/**
+ * Each claim scores at most 200 candidates: the 150 with the highest raw priority, plus
+ * the 50 that have waited longest. Aging is applied when scoring, so without the second
+ * lane a task that has aged past newer, higher-priority work would never be considered
+ * while 150+ of those are queued.
+ */
+const PRIORITY_WINDOW = 150;
+const AGING_WINDOW = 50;
 
 export interface WorkerRow {
   id: string;
@@ -49,6 +58,8 @@ export interface LeasedTask {
   attemptDeadline: string;
   /** Stable across attempts; handlers use it to make external side effects idempotent. */
   idempotencyKey: string;
+  /** The run's W3C trace context; workers send it back with this task's reports (ADR-017). */
+  traceparent: string | null;
 }
 
 /**
@@ -57,12 +68,25 @@ export interface LeasedTask {
  * claimed under its run lock with `state = 'queued'` as the guard, so concurrent
  * claimers can never lease the same task twice.
  */
-export async function claimTasks(ctx: EngineContext, worker: WorkerRow, capacity: ClaimCapacity): Promise<LeasedTask[]> {
-  if (worker.state !== "active" || capacity.freeSlots <= 0) return [];
+export function claimTasks(ctx: EngineContext, worker: WorkerRow, capacity: ClaimCapacity): Promise<LeasedTask[]> {
+  if (worker.state !== "active" || capacity.freeSlots <= 0) return Promise.resolve([]);
+  return withSpan(
+    "flowforge.claim_tasks",
+    { "flowforge.tenant_id": worker.tenantId, "flowforge.worker_id": worker.id, "flowforge.free_slots": capacity.freeSlots },
+    async (span) => {
+      const leased = await claimTasksTx(ctx, worker, capacity);
+      span.setAttribute("flowforge.tasks.leased", leased.length);
+      // One claim can lease tasks of several runs: link each run's trace.
+      span.addLinks([...new Set(leased.map((l) => l.traceparent))].flatMap((tp) => linkTo(tp)));
+      return leased;
+    },
+  );
+}
+
+async function claimTasksTx(ctx: EngineContext, worker: WorkerRow, capacity: ClaimCapacity): Promise<LeasedTask[]> {
   const now = ctx.now();
   return ctx.db.transaction(async (tx) => {
-    const candidates = await tx
-      .select({
+    const columns = {
         id: schema.tasks.id,
         runId: schema.tasks.runId,
         type: schema.tasks.type,
@@ -72,18 +96,17 @@ export async function claimTasks(ctx: EngineContext, worker: WorkerRow, capacity
         requiredCapabilities: schema.tasks.requiredCapabilities,
         cpu: schema.tasks.cpu,
         memoryMb: schema.tasks.memoryMb,
-      })
-      .from(schema.tasks)
-      .where(
-        and(
-          eq(schema.tasks.tenantId, worker.tenantId),
-          eq(schema.tasks.state, "queued"),
-          inArray(schema.tasks.queue, worker.queues),
-          inArray(schema.tasks.type, worker.taskTypes),
-        ),
-      )
-      .orderBy(desc(schema.tasks.priority), asc(schema.tasks.enqueuedAt))
-      .limit(CANDIDATE_WINDOW);
+    };
+    const eligible = and(
+      eq(schema.tasks.tenantId, worker.tenantId),
+      eq(schema.tasks.state, "queued"),
+      inArray(schema.tasks.queue, worker.queues),
+      inArray(schema.tasks.type, worker.taskTypes),
+    );
+    const byPriority = await tx.select(columns).from(schema.tasks).where(eligible).orderBy(desc(schema.tasks.priority), asc(schema.tasks.enqueuedAt)).limit(PRIORITY_WINDOW);
+    const longestWaiting = await tx.select(columns).from(schema.tasks).where(eligible).orderBy(asc(schema.tasks.enqueuedAt)).limit(AGING_WINDOW);
+    const seen = new Set(byPriority.map((c) => c.id));
+    const candidates = [...byPriority, ...longestWaiting.filter((c) => !seen.has(c.id))];
     if (candidates.length === 0) return [];
 
     const runIds = [...new Set(candidates.map((c) => c.runId))];
@@ -139,11 +162,20 @@ export async function claimTasks(ctx: EngineContext, worker: WorkerRow, capacity
       },
     );
 
+    if (result.selected.length === 0) return [];
+    // The tenant-wide cap is enforced atomically: claims for one tenant serialise on the
+    // tenant row lock, and only claims add running tasks, so this count cannot be
+    // overtaken before we commit (ADR-013). Lock order: tenant -> run -> task.
+    const tenantRow = await lockTenant(tx, worker.tenantId);
+    let tenantSlots = tenantRow.maxConcurrency - (await countRunningTasks(tx, worker.tenantId));
+    if (tenantSlots <= 0) return [];
+
     // Claim in run-id order (lock ordering), re-checking concurrency under the run lock.
     const byRun = new Map<string, CandidateTask[]>();
     for (const t of result.selected) byRun.set(t.runId, [...(byRun.get(t.runId) ?? []), t]);
     const leased: LeasedTask[] = [];
     for (const runId of [...byRun.keys()].sort()) {
+      if (tenantSlots <= 0) break;
       const [run] = await tx
         .select()
         .from(schema.workflowRuns)
@@ -155,34 +187,50 @@ export async function claimTasks(ctx: EngineContext, worker: WorkerRow, capacity
         .from(schema.tasks)
         .where(and(eq(schema.tasks.runId, runId), eq(schema.tasks.state, "running")));
       let slots = run.maxConcurrency - runningNow;
-      for (const cand of byRun.get(runId)!) {
-        if (slots <= 0) break;
-        const claimed = await leaseOne(ctx, tx, run, cand.id, worker.id, now);
-        if (!claimed) continue;
-        slots -= 1;
-        leased.push(claimed);
-        const a = advice.get(cand.taskType);
-        await tx.insert(schema.schedulingDecisions).values({
-          tenantId: worker.tenantId,
-          taskId: cand.id,
-          workerId: worker.id,
-          strategy: a ? "predictive" : "deterministic",
-          score: result.scores.get(cand.id) ?? cand.priority,
-          advisorUsed: Boolean(a),
-          predictedDurationMs: a?.predictedDurationMs ?? null,
-          confidence: a?.confidence ?? null,
-          modelVersion: a ? (ctx.advisor?.modelVersion ?? null) : null,
-          createdAt: now,
-        });
+      const queue = byRun.get(runId)!;
+      // Lease in batches: one guarded UPDATE plus one insert per side table, so the
+      // tenant lock is held for a fixed number of round trips per run, not per task.
+      while (slots > 0 && tenantSlots > 0 && queue.length > 0) {
+        const take = queue.splice(0, Math.min(slots, tenantSlots));
+        const claimed = await leaseBatch(ctx, tx, run, take, worker.id, now);
+        slots -= claimed.length;
+        tenantSlots -= claimed.length;
+        leased.push(...claimed);
+        if (claimed.length === 0) continue;
+        const ids = new Set(claimed.map((c) => c.taskId));
+        await tx.insert(schema.schedulingDecisions).values(
+          take
+            .filter((cand) => ids.has(cand.id))
+            .map((cand) => {
+              const a = advice.get(cand.taskType);
+              return {
+                tenantId: worker.tenantId,
+                taskId: cand.id,
+                workerId: worker.id,
+                strategy: a ? "predictive" : "deterministic",
+                score: result.scores.get(cand.id) ?? cand.priority,
+                advisorUsed: Boolean(a),
+                predictedDurationMs: a?.predictedDurationMs ?? null,
+                confidence: a?.confidence ?? null,
+                modelVersion: a ? (ctx.advisor?.modelVersion ?? null) : null,
+                createdAt: now,
+              };
+            }),
+        );
       }
     }
     return leased;
   });
 }
 
-async function leaseOne(ctx: EngineContext, tx: Tx, run: RunRow, taskId: string, workerId: string, now: Date): Promise<LeasedTask | null> {
+/**
+ * Lease the given queued tasks of one locked run. The `state = 'queued'` guard means a
+ * task claimed by someone else since candidate selection is simply not returned.
+ * Results keep the candidates' order.
+ */
+async function leaseBatch(ctx: EngineContext, tx: Tx, run: RunRow, cands: CandidateTask[], workerId: string, now: Date): Promise<LeasedTask[]> {
   assertTaskTransition("queued", "running");
-  const [t] = await tx
+  const rows = await tx
     .update(schema.tasks)
     .set({
       state: "running",
@@ -193,22 +241,26 @@ async function leaseOne(ctx: EngineContext, tx: Tx, run: RunRow, taskId: string,
       leaseExpiresAt: sql`least(${new Date(now.getTime() + ctx.leaseDurationMs).toISOString()}::timestamptz, ${now.toISOString()}::timestamptz + (${schema.tasks.timeoutMs} || ' milliseconds')::interval)`,
       startedAt: sql`coalesce(${schema.tasks.startedAt}, ${now.toISOString()}::timestamptz)`,
     })
-    .where(and(eq(schema.tasks.id, taskId), eq(schema.tasks.state, "queued")))
+    .where(and(inArray(schema.tasks.id, cands.map((c) => c.id)), eq(schema.tasks.state, "queued")))
     .returning();
-  if (!t) return null;
-  await tx.insert(schema.taskAttempts).values({
-    tenantId: t.tenantId,
-    taskId: t.id,
-    runId: t.runId,
-    attempt: t.attempts,
-    fence: t.fence,
-    workerId,
-    startedAt: now,
-  });
-  await recordEvents(tx, [
-    { tenantId: t.tenantId, runId: t.runId, taskId: t.id, type: "task.started", data: { key: t.key, attempt: t.attempts, workerId } },
-  ]);
-  return {
+  if (rows.length === 0) return [];
+  const order = new Map(cands.map((c, i) => [c.id, i]));
+  rows.sort((x, y) => order.get(x.id)! - order.get(y.id)!);
+  await tx.insert(schema.taskAttempts).values(
+    rows.map((t) => ({ tenantId: t.tenantId, taskId: t.id, runId: t.runId, attempt: t.attempts, fence: t.fence, workerId, startedAt: now })),
+  );
+  await recordEvents(
+    tx,
+    now,
+    rows.map((t) => ({
+      tenantId: t.tenantId,
+      runId: t.runId,
+      taskId: t.id,
+      type: "task.started" as const,
+      data: { key: t.key, attempt: t.attempts, workerId, queuedMs: t.enqueuedAt ? Math.max(0, now.getTime() - t.enqueuedAt.getTime()) : null },
+    })),
+  );
+  return rows.map((t) => ({
     taskId: t.id,
     runId: t.runId,
     key: t.key,
@@ -223,7 +275,8 @@ async function leaseOne(ctx: EngineContext, tx: Tx, run: RunRow, taskId: string,
     leaseExpiresAt: t.leaseExpiresAt!.toISOString(),
     attemptDeadline: t.attemptDeadline!.toISOString(),
     idempotencyKey: `${t.runId}:${t.key}`,
-  };
+    traceparent: run.traceContext,
+  }));
 }
 
 export interface FencedRequest {
@@ -242,6 +295,7 @@ async function lockForFencedChange(tx: Tx, req: FencedRequest, now: Date): Promi
   if (!ref) throw notFound("Task");
   const run = (await lockRun(tx, req.tenantId, ref.runId))!;
   const [task] = await tx.select().from(schema.tasks).where(eq(schema.tasks.id, req.taskId)).for("update");
+  annotateRun(run, task);
   const check = checkFence(
     { running: task!.state === "running", fence: task!.fence, workerId: task!.workerId, leaseExpiresAt: task!.leaseExpiresAt },
     { fence: req.fence, workerId: req.workerId },
@@ -257,7 +311,22 @@ async function lockForFencedChange(tx: Tx, req: FencedRequest, now: Date): Promi
   return { run, task: task! };
 }
 
-export async function completeTask(ctx: EngineContext, req: FencedRequest & { output: unknown }): Promise<{ duplicate: boolean }> {
+const fencedAttributes = (req: FencedRequest) => ({
+  "flowforge.tenant_id": req.tenantId,
+  "flowforge.task_id": req.taskId,
+  "flowforge.worker_id": req.workerId,
+  "flowforge.fence": req.fence,
+});
+
+export function completeTask(ctx: EngineContext, req: FencedRequest & { output: unknown }): Promise<{ duplicate: boolean }> {
+  return withSpan("flowforge.complete_task", fencedAttributes(req), async (span) => {
+    const r = await completeTaskTx(ctx, req);
+    span.setAttribute("flowforge.duplicate", r.duplicate);
+    return r;
+  });
+}
+
+async function completeTaskTx(ctx: EngineContext, req: FencedRequest & { output: unknown }): Promise<{ duplicate: boolean }> {
   const now = ctx.now();
   return ctx.db.transaction(async (tx) => {
     const locked = await lockForFencedChange(tx, req, now);
@@ -272,8 +341,8 @@ export async function completeTask(ctx: EngineContext, req: FencedRequest & { ou
       .set({ state: "succeeded", output: req.output ?? null, error: null, finishedAt: now, leaseExpiresAt: null })
       .where(eq(schema.tasks.id, task.id));
     const durationMs = await finishAttempt(tx, task, "succeeded", null, now);
-    await recordTaskStats(tx, task.tenantId, task.type, durationMs, true);
-    await recordEvents(tx, [{ tenantId: task.tenantId, runId: run.id, taskId: task.id, type: "task.succeeded", data: { key: task.key, attempt: task.attempts, durationMs } }]);
+    await recordTaskStats(tx, task.tenantId, task.type, durationMs, true, now);
+    await recordEvents(tx, now, [{ tenantId: task.tenantId, runId: run.id, taskId: task.id, type: "task.succeeded", data: { key: task.key, attempt: task.attempts, durationMs } }]);
     await advanceRun(tx, run, now);
     return { duplicate: false };
   });
@@ -285,13 +354,35 @@ export interface TaskErrorInput {
   retryable?: boolean;
 }
 
-export async function failTask(ctx: EngineContext, req: FencedRequest & { error: TaskErrorInput }): Promise<{ willRetry: boolean; duplicate: boolean }> {
+export function failTask(ctx: EngineContext, req: FencedRequest & { error: TaskErrorInput }): Promise<{ willRetry: boolean; duplicate: boolean }> {
+  return withSpan("flowforge.fail_task", fencedAttributes(req), async (span) => {
+    const r = await failTaskTx(ctx, req);
+    span.setAttributes({ "flowforge.duplicate": r.duplicate, "flowforge.will_retry": r.willRetry });
+    return r;
+  });
+}
+
+async function failTaskTx(ctx: EngineContext, req: FencedRequest & { error: TaskErrorInput }): Promise<{ willRetry: boolean; duplicate: boolean }> {
   const now = ctx.now();
   return ctx.db.transaction(async (tx) => {
     const locked = await lockForFencedChange(tx, req, now);
     if ("duplicate" in locked) {
       const s = locked.duplicate.state;
       if (s !== "failed" && s !== "retry_scheduled" && s !== "queued") throw conflict("lease_lost", "Attempt already resolved as " + s);
+      // The API resolved this attempt first (lease expiry or timeout): its outcome stands,
+      // but keep the handler's own error with it, once. It is usually the only explanation.
+      const reported = { message: req.error.message.slice(0, 4_000), code: req.error.code ?? null, retryable: req.error.retryable ?? true };
+      await tx
+        .update(schema.taskAttempts)
+        .set({ error: sql`coalesce(${schema.taskAttempts.error}, '{}'::jsonb) || jsonb_build_object('reported', ${JSON.stringify(reported)}::jsonb)` })
+        .where(
+          and(
+            eq(schema.taskAttempts.taskId, req.taskId),
+            eq(schema.taskAttempts.fence, req.fence),
+            inArray(schema.taskAttempts.outcome, ["lease_expired", "timed_out"]),
+            sql`not (coalesce(${schema.taskAttempts.error}, '{}'::jsonb) ? 'reported')`,
+          ),
+        );
       return { willRetry: s !== "failed", duplicate: true };
     }
     const kind: FailureKind = req.error.retryable === false ? "non_retryable" : "error";
@@ -311,7 +402,7 @@ export async function failAttempt(tx: Tx, run: RunRow, task: TaskRow, kind: Fail
   const errorJson = { message: error.message.slice(0, 4_000), code: error.code ?? kind, kind, attempt: task.attempts };
   const outcome = kind === "timeout" ? "timed_out" : kind === "lease_expired" ? "lease_expired" : "failed";
   const durationMs = await finishAttempt(tx, task, outcome, errorJson, now);
-  await recordTaskStats(tx, task.tenantId, task.type, durationMs, false);
+  await recordTaskStats(tx, task.tenantId, task.type, durationMs, false, now);
 
   if (decision.retry) {
     assertTaskTransition("running", "retry_scheduled");
@@ -320,8 +411,8 @@ export async function failAttempt(tx: Tx, run: RunRow, task: TaskRow, kind: Fail
       .update(schema.tasks)
       .set({ state: "retry_scheduled", error: errorJson, availableAt, leaseExpiresAt: null })
       .where(eq(schema.tasks.id, task.id));
-    await recordEvents(tx, [
-      { tenantId: task.tenantId, runId: run.id, taskId: task.id, type: "task.retry_scheduled", data: { key: task.key, attempt: task.attempts, delayMs: decision.delayMs, kind } },
+    await recordEvents(tx, now, [
+      { tenantId: task.tenantId, runId: run.id, taskId: task.id, type: "task.retry_scheduled", data: { key: task.key, attempt: task.attempts, delayMs: decision.delayMs, kind, durationMs } },
     ]);
     return true;
   }
@@ -339,7 +430,7 @@ export async function failAttempt(tx: Tx, run: RunRow, task: TaskRow, kind: Fail
     lastError: errorJson,
     createdAt: now,
   });
-  await recordEvents(tx, [{ tenantId: task.tenantId, runId: run.id, taskId: task.id, type: "task.failed", data: { key: task.key, attempt: task.attempts, kind } }]);
+  await recordEvents(tx, now, [{ tenantId: task.tenantId, runId: run.id, taskId: task.id, type: "task.failed", data: { key: task.key, attempt: task.attempts, kind, durationMs } }]);
   await advanceRun(tx, run, now);
   return false;
 }
@@ -359,19 +450,19 @@ async function finishAttempt(tx: Tx, task: TaskRow, outcome: "succeeded" | "fail
 }
 
 /** Welford running mean/variance plus an EWMA of successful durations, per task type. */
-async function recordTaskStats(tx: Tx, tenantId: string, taskType: string, durationMs: number, success: boolean): Promise<void> {
+async function recordTaskStats(tx: Tx, tenantId: string, taskType: string, durationMs: number, success: boolean, now: Date): Promise<void> {
   const t = schema.taskTypeStats;
   if (!success) {
     await tx
       .insert(t)
-      .values({ tenantId, taskType, failures: 1 })
-      .onConflictDoUpdate({ target: [t.tenantId, t.taskType], set: { failures: sql`${t.failures} + 1`, updatedAt: sql`now()` } });
+      .values({ tenantId, taskType, failures: 1, updatedAt: now })
+      .onConflictDoUpdate({ target: [t.tenantId, t.taskType], set: { failures: sql`${t.failures} + 1`, updatedAt: now } });
     return;
   }
   const d = durationMs;
   await tx
     .insert(t)
-    .values({ tenantId, taskType, samples: 1, meanDurationMs: d, m2DurationMs: 0, ewmaDurationMs: d })
+    .values({ tenantId, taskType, samples: 1, meanDurationMs: d, m2DurationMs: 0, ewmaDurationMs: d, updatedAt: now })
     .onConflictDoUpdate({
       target: [t.tenantId, t.taskType],
       set: {
@@ -379,7 +470,7 @@ async function recordTaskStats(tx: Tx, tenantId: string, taskType: string, durat
         meanDurationMs: sql`${t.meanDurationMs} + (${d} - ${t.meanDurationMs}) / (${t.samples} + 1)`,
         m2DurationMs: sql`${t.m2DurationMs} + (${d} - ${t.meanDurationMs}) * (${d} - (${t.meanDurationMs} + (${d} - ${t.meanDurationMs}) / (${t.samples} + 1)))`,
         ewmaDurationMs: sql`case when ${t.samples} = 0 then ${d}::float8 else 0.2 * ${d} + 0.8 * ${t.ewmaDurationMs} end`,
-        updatedAt: sql`now()`,
+        updatedAt: now,
       },
     });
 }
@@ -435,24 +526,28 @@ export async function renewLeases(ctx: EngineContext, tenantId: string, workerId
 const MAX_CHECKPOINT_BYTES = 256 * 1024;
 
 export async function saveCheckpoint(ctx: EngineContext, req: FencedRequest & { checkpoint: unknown }): Promise<void> {
-  if (JSON.stringify(req.checkpoint ?? null).length > MAX_CHECKPOINT_BYTES) {
+  if (Buffer.byteLength(JSON.stringify(req.checkpoint ?? null), "utf8") > MAX_CHECKPOINT_BYTES) {
     throw new AppError(413, "checkpoint_too_large", `Checkpoint exceeds ${MAX_CHECKPOINT_BYTES} bytes`);
   }
   const now = ctx.now();
-  const [r] = await ctx.db
-    .update(schema.tasks)
-    .set({ checkpoint: req.checkpoint ?? null, checkpointAt: now })
-    .where(
-      and(
-        eq(schema.tasks.tenantId, req.tenantId),
-        eq(schema.tasks.id, req.taskId),
-        eq(schema.tasks.state, "running"),
-        eq(schema.tasks.workerId, req.workerId),
-        eq(schema.tasks.fence, req.fence),
-        gt(schema.tasks.leaseExpiresAt, now),
-      ),
-    )
-    .returning({ runId: schema.tasks.runId, key: schema.tasks.key });
-  if (!r) throw conflict("lease_lost", "Lease is no longer held");
-  await recordEvents(ctx.db, [{ tenantId: req.tenantId, runId: r.runId, taskId: req.taskId, type: "task.checkpointed", data: { key: r.key } }]);
+  // The checkpoint and its event commit together (or neither does).
+  await ctx.db.transaction(async (tx) => {
+    const [r] = await tx
+      .update(schema.tasks)
+      .set({ checkpoint: req.checkpoint ?? null, checkpointAt: now })
+      .where(
+        and(
+          eq(schema.tasks.tenantId, req.tenantId),
+          eq(schema.tasks.id, req.taskId),
+          eq(schema.tasks.state, "running"),
+          eq(schema.tasks.workerId, req.workerId),
+          eq(schema.tasks.fence, req.fence),
+          gt(schema.tasks.leaseExpiresAt, now),
+        ),
+      )
+      .returning({ runId: schema.tasks.runId, key: schema.tasks.key });
+    if (!r) throw conflict("lease_lost", "Lease is no longer held");
+    await recordEvents(tx, now, [{ tenantId: req.tenantId, runId: r.runId, taskId: req.taskId, type: "task.checkpointed", data: { key: r.key } }]);
+  });
 }
+

@@ -1,0 +1,1 @@
+CREATE INDEX "tasks_aging_idx" ON "tasks" USING btree ("tenant_id","enqueued_at") WHERE "tasks"."state" = 'queued';

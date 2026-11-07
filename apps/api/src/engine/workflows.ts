@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { compileWorkflow, formatDagIssue, type CompiledWorkflow } from "@flowforge/core";
 import { schema } from "@flowforge/db";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { AppError, notFound } from "../errors.js";
 import type { EngineContext } from "./context.js";
+import { countWorkflows, lockTenant, quotaExceeded } from "./quotas.js";
 
 export interface RegisteredVersion {
   workflowId: string;
@@ -16,7 +17,14 @@ export interface RegisteredVersion {
  * Validate a definition and store it as a new immutable version. Registering a
  * definition identical to an existing version returns that version (idempotent deploys).
  */
-export async function registerWorkflow(ctx: EngineContext, tenantId: string, input: unknown): Promise<RegisteredVersion> {
+export const DEFAULT_DEFINITION_MAX_BYTES = 256 * 1024;
+
+export async function registerWorkflow(
+  ctx: EngineContext,
+  tenantId: string,
+  input: unknown,
+  opts: { maxDefinitionBytes?: number } = {},
+): Promise<RegisteredVersion> {
   const compiled = compileWorkflow(input);
   if (!compiled.ok) {
     throw new AppError(422, "invalid_workflow", "Workflow definition is invalid", {
@@ -24,13 +32,29 @@ export async function registerWorkflow(ctx: EngineContext, tenantId: string, inp
     });
   }
   const def = compiled.workflow.definition;
-  const checksum = createHash("sha256").update(canonicalJson(def)).digest("hex");
+  const canonical = canonicalJson(def);
+  const maxBytes = opts.maxDefinitionBytes ?? DEFAULT_DEFINITION_MAX_BYTES;
+  const bytes = Buffer.byteLength(canonical, "utf8");
+  if (bytes > maxBytes) {
+    throw new AppError(413, "definition_too_large", `Workflow definition is ${bytes} bytes; the limit is ${maxBytes}`, { bytes, limit: maxBytes });
+  }
+  const checksum = createHash("sha256").update(canonical).digest("hex");
 
+  const now = ctx.now();
   return ctx.db.transaction(async (tx) => {
+    const tenant = await lockTenant(tx, tenantId);
+    const [known] = await tx
+      .select({ id: schema.workflows.id })
+      .from(schema.workflows)
+      .where(and(eq(schema.workflows.tenantId, tenantId), eq(schema.workflows.name, def.name)));
+    if (!known) {
+      const count = await countWorkflows(tx, tenantId);
+      if (count >= tenant.maxWorkflows) throw quotaExceeded("max_workflows", tenant.maxWorkflows, count);
+    }
     // Upsert the workflow row and lock it so concurrent registrations serialise.
     await tx
       .insert(schema.workflows)
-      .values({ tenantId, name: def.name, description: def.description ?? null })
+      .values({ tenantId, name: def.name, description: def.description ?? null, createdAt: now, updatedAt: now })
       .onConflictDoNothing({ target: [schema.workflows.tenantId, schema.workflows.name] });
     const [wf] = await tx
       .select()
@@ -45,14 +69,18 @@ export async function registerWorkflow(ctx: EngineContext, tenantId: string, inp
       .where(and(eq(schema.workflowVersions.workflowId, wf.id), eq(schema.workflowVersions.checksum, checksum)));
     if (existing) return { workflowId: wf.id, versionId: existing.id, version: existing.version, created: false };
 
+    // Versions are never deleted, so latestVersion is the version count.
+    if (wf.latestVersion >= tenant.maxVersionsPerWorkflow) {
+      throw quotaExceeded("max_versions_per_workflow", tenant.maxVersionsPerWorkflow, wf.latestVersion);
+    }
     const version = wf.latestVersion + 1;
     const [row] = await tx
       .insert(schema.workflowVersions)
-      .values({ tenantId, workflowId: wf.id, version, definition: def, checksum })
+      .values({ tenantId, workflowId: wf.id, version, definition: def, checksum, createdAt: now })
       .returning({ id: schema.workflowVersions.id });
     await tx
       .update(schema.workflows)
-      .set({ latestVersion: version, description: def.description ?? null, updatedAt: sql`now()` })
+      .set({ latestVersion: version, description: def.description ?? null, updatedAt: now })
       .where(eq(schema.workflows.id, wf.id));
     return { workflowId: wf.id, versionId: row!.id, version, created: true };
   });

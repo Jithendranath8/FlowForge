@@ -20,7 +20,9 @@ export interface Task {
   type: string;
   state: TaskState;
   attempts: number;
+  /** Null when larger than 16 KiB (`outputTruncated`); fetch the task for the full output. */
   output: unknown;
+  outputTruncated?: boolean;
   error: { message: string; code: string } | null;
 }
 
@@ -74,13 +76,17 @@ export class FlowForgeClient {
     return (await this.http.request<{ task: Task }>("POST", `/v1/tasks/${encodeURIComponent(taskId)}/retry`)).task;
   }
 
-  /** Poll until the run reaches a terminal state or the timeout elapses. */
+  /**
+   * Poll until the run reaches a terminal state or the timeout elapses. The timeout is
+   * measured on the monotonic clock, so wall-clock jumps (NTP steps, host suspend) do
+   * not end the wait early.
+   */
   async waitForRun(runId: string, opts: { timeoutMs?: number; intervalMs?: number } = {}) {
-    const deadline = Date.now() + (opts.timeoutMs ?? 5 * 60_000);
+    const deadline = performance.now() + (opts.timeoutMs ?? 5 * 60_000);
     for (;;) {
       const r = await this.getRun(runId);
       if (r.run.state !== "running") return r;
-      if (Date.now() >= deadline) throw new Error(`Run ${runId} still running after ${opts.timeoutMs ?? 300_000}ms`);
+      if (performance.now() >= deadline) throw new Error(`Run ${runId} still running after ${opts.timeoutMs ?? 300_000}ms`);
       await new Promise((res) => setTimeout(res, opts.intervalMs ?? 500));
     }
   }

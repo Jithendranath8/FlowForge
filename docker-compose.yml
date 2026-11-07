@@ -10,7 +10,8 @@ services:
     ports: ["127.0.0.1:54329:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U flowforge -d flowforge"]
+      # Over TCP: during first-time init the image runs a temporary server on the socket only.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U flowforge -d flowforge"]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -23,5 +24,40 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # Observability stack (ADR-017): `docker compose --profile observability up -d`.
+  # Run the API on the host with TRACING_ENABLED=true and
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:54318. Docker Desktop reaches the default
+  # METRICS_HOST=127.0.0.1; on Linux bind it to the docker bridge. See docs/OPERATIONS.md.
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    profiles: [observability]
+    volumes:
+      - ./deploy/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/observability/prometheus/rules:/etc/prometheus/rules:ro
+    ports: ["127.0.0.1:59090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+  grafana:
+    image: grafana/grafana:13.2.4
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: flowforge_dev_only
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/flowforge-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:53001:3000"]
+    depends_on: [prometheus, jaeger]
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    profiles: [observability]
+    ports:
+      - "127.0.0.1:56686:16686" # UI
+      - "127.0.0.1:54318:4318" # OTLP/HTTP
+
 volumes:
   pgdata:

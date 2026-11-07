@@ -8,6 +8,55 @@
       "when": 1793518849906,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1793679008784,
+      "tag": "0001_outbox_relay_claim",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793683434013,
+      "tag": "0002_tenant_quotas",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793952700657,
+      "tag": "0003_retention_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793955779520,
+      "tag": "0004_run_trace_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793965532943,
+      "tag": "0005_users_email_unique",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793971998975,
+      "tag": "0006_attempts_tenant_finished",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1793981791784,
+      "tag": "0007_tasks_aging_index",
+      "breakpoints": true
     }
   ]
 }

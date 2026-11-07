@@ -37,7 +37,7 @@ const worker = createWorker({
       log(ctx, "start");
       await sleep(Number(ctx.runInput.hangMs ?? 3_000), ctx.signal);
       log(ctx, "done");
-      return { pid: process.pid };
+      return { pid: process.pid, attempt: ctx.attempt };
     },
     "e2e.flaky": async (ctx) => {
       log(ctx, "start");
@@ -49,4 +49,4 @@ const worker = createWorker({
 });
 
 await worker.start();
-console.log(`ready ${worker.id}`);
+process.stdout.write(`ready ${worker.id}\n`);
