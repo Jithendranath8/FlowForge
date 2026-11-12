@@ -3,10 +3,14 @@
  * 400 before any handler runs:
  *  - a NUL character: text and jsonb both reject it;
  *  - a lone UTF-16 surrogate (invalid Unicode): jsonb rejects it, and text would silently
- *    store a replacement character instead of what was sent.
+ *    store a replacement character instead of what was sent;
+ *  - nesting deep enough to overflow a stack when the value is serialised.
  * Left to the database these surface as a 500, which workers retry: a handler whose
  * output contained a NUL was re-run until its retries ran out.
  */
+
+/** Deepest allowed nesting of arrays and objects in a request value. */
+export const MAX_JSON_DEPTH = 100;
 
 const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
@@ -22,18 +26,19 @@ function badText(s: string): string | null {
  * value is chosen by the client.
  */
 export function findUnstorable(root: unknown, label: string): string | null {
-  const stack: { value: unknown; path: string }[] = [{ value: root, path: label }];
+  const stack: { value: unknown; path: string; depth: number }[] = [{ value: root, path: label, depth: 0 }];
   for (let item = stack.pop(); item; item = stack.pop()) {
-    const { value, path } = item;
+    const { value, path, depth } = item;
     if (typeof value === "string") {
       const why = badText(value);
       if (why) return `${path} contains ${why}`;
       continue;
     }
     if (value === null || typeof value !== "object") continue;
+    if (depth >= MAX_JSON_DEPTH) return `${path} is nested more than ${MAX_JSON_DEPTH} levels deep`;
     // Pushed in reverse so values are visited in document order.
     if (Array.isArray(value)) {
-      for (let i = value.length - 1; i >= 0; i--) stack.push({ value: value[i], path: `${path}[${i}]` });
+      for (let i = value.length - 1; i >= 0; i--) stack.push({ value: value[i], path: `${path}[${i}]`, depth: depth + 1 });
       continue;
     }
     const entries = Object.entries(value);
@@ -41,7 +46,7 @@ export function findUnstorable(root: unknown, label: string): string | null {
       const [k, v] = entries[i]!;
       const why = badText(k);
       if (why) return `a key of ${path} contains ${why}`;
-      stack.push({ value: v, path: `${path}.${k}` });
+      stack.push({ value: v, path: `${path}.${k}`, depth: depth + 1 });
     }
   }
   return null;

@@ -2,6 +2,7 @@ import { type DbHandle } from "@flowforge/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../../src/http/app.js";
+import { MAX_JSON_DEPTH } from "../../src/http/hygiene.js";
 import { TestClock, createApiKey, createTenant, makeContext, resetData, setupDatabase } from "./harness.js";
 
 /*
@@ -117,6 +118,17 @@ describe.each([
 it("refuses a NUL character in a path parameter", async () => {
   expectRefused(await call("GET", "/v1/workflows/a%00b", key));
   expectRefused(await call("POST", "/v1/workflows/a%00b/runs", key, {}));
+});
+
+it("refuses JSON nested deeper than the limit instead of overflowing the stack", async () => {
+  await call("PUT", "/v1/workflows", key, definition);
+  const nested = (depth: number) => `{"input":{"a":${"[".repeat(depth)}${"]".repeat(depth)}}}`;
+  const send = (payload: string) => app.inject({ method: "POST", url: "/v1/workflows/job/runs", payload, headers: { authorization: `Bearer ${key}`, "content-type": "application/json" } });
+  const deep = await send(nested(100_000));
+  expectRefused(deep);
+  expect(deep.json().error.message).toMatch(/nested/);
+  expectRefused(await send(nested(MAX_JSON_DEPTH)));
+  expect((await send(nested(MAX_JSON_DEPTH - 2))).statusCode).toBe(201); // input -> a -> 98 arrays
 });
 
 it("says where the offending text is", async () => {

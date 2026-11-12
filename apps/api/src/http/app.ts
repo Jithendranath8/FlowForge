@@ -106,8 +106,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     }
   });
 
-  // Text PostgreSQL cannot store is refused here (after authentication and body parsing),
-  // so it can never reach a query and come back as a 500.
+  // Text PostgreSQL cannot store, or nesting too deep to serialise, is refused here (after
+  // authentication and body parsing) so it can never reach a query and come back as a 500.
   app.addHook("preValidation", async (req) => {
     const problem = findUnstorable(req.params, "path") ?? findUnstorable(req.query, "query") ?? findUnstorable(req.body, "body");
     if (problem) throw badRequest(`Request ${problem}`);
