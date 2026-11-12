@@ -232,6 +232,33 @@ describe("lease loss and recovery", () => {
     expect(n).toBe(3);
   });
 
+  it("replaces characters the API refuses (NUL, invalid Unicode) in a failure report, so the real error is recorded", async () => {
+    api.pending.push(makeTask());
+    await start({
+      handlers: {
+        job: () => {
+          throw new NonRetryableError("driver said: bad\u0000byte and \ud800 half a pair, 🚀 kept", "E\u0000CODE");
+        },
+      },
+    });
+    await until(() => reports("fail").length === 1);
+    const err = (reports("fail")[0]!.body as { error: { message: string; code: string; retryable: boolean } }).error;
+    expect(err).toEqual({ message: "driver said: bad\ufffdbyte and \ufffd half a pair, 🚀 kept", code: "E\ufffdCODE", retryable: false });
+  });
+
+  it("never cuts an over-long error message in the middle of a character", async () => {
+    api.pending.push(makeTask());
+    const suffix = "… (truncated)";
+    // The cut lands between the two halves of the rocket.
+    const message = "x".repeat(4_000 - suffix.length - 1) + "🚀" + "y".repeat(500);
+    await start({ handlers: { job: () => Promise.reject(new Error(message)) } });
+    await until(() => reports("fail").length === 1);
+    const sent = (reports("fail")[0]!.body as { error: { message: string } }).error.message;
+    expect(sent.length).toBeLessThanOrEqual(4_000);
+    expect(sent.endsWith(suffix)).toBe(true);
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(sent)).toBe(false);
+  });
+
   it("fits failure reports to the API's limits, keeping the non-retryable flag", async () => {
     api.pending.push(makeTask());
     await start({

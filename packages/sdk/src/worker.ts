@@ -438,13 +438,25 @@ export function createWorker(opts: WorkerOptions): Worker {
 const MAX_ERROR_MESSAGE = 4_000;
 const MAX_ERROR_CODE = 100;
 
-/** An error report the API accepts: an over-long message or code is cut, never rejected. */
+/**
+ * Characters the API refuses because its database cannot store them: NUL and unpaired
+ * UTF-16 surrogates. In an error report they become U+FFFD, so the report is accepted.
+ */
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+/**
+ * An error report the API accepts: an over-long message or code is cut and unstorable
+ * characters are replaced, never rejected. A rejected report would leave the attempt to
+ * expire as a lost lease, hiding the handler's real error.
+ */
 function reportableError(message: string, code: string, retryable: boolean) {
   const suffix = "… (truncated)";
   const m = message || "Error";
+  // Cut first, then replace: a cut can split a surrogate pair and leave half of it.
+  const clean = (s: string) => s.replaceAll("\u0000", "\ufffd").replace(LONE_SURROGATE, "\ufffd");
   return {
-    message: m.length > MAX_ERROR_MESSAGE ? m.slice(0, MAX_ERROR_MESSAGE - suffix.length) + suffix : m,
-    code: code.slice(0, MAX_ERROR_CODE),
+    message: m.length > MAX_ERROR_MESSAGE ? clean(m.slice(0, MAX_ERROR_MESSAGE - suffix.length)) + suffix : clean(m),
+    code: clean(code.slice(0, MAX_ERROR_CODE)),
     retryable,
   };
 }
