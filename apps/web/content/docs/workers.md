@@ -108,7 +108,7 @@ The context does not contain upstream tasks' outputs. A handler that needs one c
 
 The handler's return value becomes the task's output. `undefined` is stored as `null`. The value must be JSON-serialisable, and the completion request that carries it must fit the API's body limit (`MAX_PAYLOAD_BYTES`, 1 MiB by default). An output that cannot be serialised (a `BigInt`, a circular structure) fails the attempt at once with code `output_rejected`, without a retry.
 
-When the API refuses an output (`413` because it is too large, or `400`), the SDK reports the attempt as a non-retryable failure with code `output_rejected` and a message saying why, because the same output would be refused again. Keep outputs small and store large results elsewhere, returning a reference.
+When the API refuses an output (`413` because it is too large, or `400`, for example because a string in it contains a NUL character, which PostgreSQL cannot store), the SDK reports the attempt as a non-retryable failure with code `output_rejected` and a message saying why, because the same output would be refused again. Keep outputs small and store large results elsewhere, returning a reference.
 
 ## Throwing errors
 
@@ -121,7 +121,7 @@ A handler fails its attempt by throwing, or by returning a rejected promise. The
 
 There is no per-error-type retry configuration. Throw `NonRetryableError` for failures that a retry cannot fix, such as invalid input. Throw anything else for failures that might pass on a later attempt.
 
-The API accepts a failure message of up to 4,000 characters and a code of up to 100. The SDK cuts longer ones to fit (the message ends with `… (truncated)`), so the failure is always recorded and `NonRetryableError` stays non-retryable.
+The API accepts a failure message of up to 4,000 characters and a code of up to 100. The SDK cuts longer ones to fit (the message ends with `… (truncated)`) and replaces characters the API refuses (a NUL character, an unpaired UTF-16 surrogate) with U+FFFD, so the failure is always recorded and `NonRetryableError` stays non-retryable.
 
 ```ts
 "invoice.send": async ({ runInput, idempotencyKey, signal }) => {

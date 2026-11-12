@@ -85,6 +85,7 @@ Every error response has the same envelope:
 | Status | Code | When |
 | --- | --- | --- |
 | 400 | `invalid_request` | A path parameter, query parameter or body failed validation (`details.issues` lists each problem as `{ path, message }`), a cursor is malformed, or you asked to retry a task that is not `failed` |
+| 400 | `invalid_request` | The request contains text the database cannot store: a NUL character (`\u0000`) or an unpaired UTF-16 surrogate, in any string or object key of the path, query or body. Also a body nested more than 100 levels deep. The message says where, for example `Request body.input.items[1].note contains a NUL character (\u0000)` |
 | 400 | `fst_err_ctp_invalid_json_body` | The body is not valid JSON but `Content-Type` is `application/json` |
 | 400 | `fst_err_ctp_empty_json_body` | `Content-Type` is `application/json` but the body is empty. Omit the header on `POST` requests that have no body |
 | 401 | `unauthorized` | No credential, or the credential is malformed, unknown, revoked or expired |
