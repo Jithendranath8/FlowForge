@@ -10,7 +10,7 @@ import { EventFeed } from "../infra/feed.js";
 import { metrics } from "../infra/metrics.js";
 import { registerHttpTracing } from "../infra/tracing.js";
 import { hasScope, makeAuthenticate, type SessionResolver } from "./auth.js";
-import { findUnstorable } from "./hygiene.js";
+import { findUnstorable, unstorableText } from "./hygiene.js";
 import { clientKey, FixedWindowLimiter, parseTrustProxy } from "./limits.js";
 import { authRoutes, makeSessionResolver, type AuthRuntime } from "./routes/auth.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
@@ -131,6 +131,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
         .code(503)
         .header("retry-after", "1")
         .send({ error: { code: db === "timeout" ? "database_timeout" : "database_unavailable", message: "Database temporarily unavailable", requestId: req.id } });
+    }
+    // Should not happen: the request check above refuses such text first.
+    if (unstorableText(err)) {
+      req.log.warn({ err }, "database refused text the request check let through");
+      metrics.httpErrors.inc({ code: "invalid_request" });
+      return reply.code(400).send({ error: { code: "invalid_request", message: "Request contains text that cannot be stored (a NUL character or invalid Unicode)", requestId: req.id } });
     }
     const status = err.statusCode ?? 500;
     if (status < 500) {

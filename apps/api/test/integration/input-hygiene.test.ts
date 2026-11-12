@@ -1,8 +1,8 @@
-import { type DbHandle } from "@flowforge/db";
+import { schema, type DbHandle } from "@flowforge/db";
 import type { FastifyInstance } from "fastify";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../../src/http/app.js";
-import { MAX_JSON_DEPTH } from "../../src/http/hygiene.js";
+import { MAX_JSON_DEPTH, unstorableText } from "../../src/http/hygiene.js";
 import { TestClock, createApiKey, createTenant, makeContext, resetData, setupDatabase } from "./harness.js";
 
 /*
@@ -144,4 +144,26 @@ it("accepts ordinary Unicode, including astral characters and escapes that look 
   const r = await call("POST", "/v1/workflows/job/runs", key, { input });
   expect(r.statusCode).toBe(201);
   expect(r.json().run.input).toEqual(input);
+});
+
+describe("backstop", () => {
+  it("recognises PostgreSQL's own refusal of such text, in case a path skips the request check", async () => {
+    const tenant = await createTenant(h, "direct");
+    const jsonb = await h.db.insert(schema.workflows).values({ tenantId: tenant, name: "x", description: `d${NUL}` }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(unstorableText(jsonb)).toBe(true);
+    const lone = await h.sql`select ${JSON.stringify({ s: LONE })}::jsonb`.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(unstorableText(lone)).toBe(true);
+    expect(unstorableText(new Error("something else"))).toBe(false);
+    const other = await h.sql`select 1/0`.then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(unstorableText(other)).toBe(false);
+  });
 });

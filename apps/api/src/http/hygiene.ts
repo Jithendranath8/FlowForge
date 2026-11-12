@@ -51,3 +51,18 @@ export function findUnstorable(root: unknown, label: string): string | null {
   }
   return null;
 }
+
+/**
+ * Whether a database error is PostgreSQL refusing such text: the backstop for a value
+ * that reached a query without passing through the request check.
+ */
+export function unstorableText(err: unknown): boolean {
+  for (let e = err, depth = 0; e && typeof e === "object" && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
+    const { code, message, detail } = e as { code?: unknown; message?: unknown; detail?: unknown };
+    // character_not_in_repertoire (NUL in text), untranslatable_character (\u0000 in jsonb).
+    if (code === "22021" || code === "22P05") return true;
+    // invalid_text_representation covers much more than Unicode; only the surrogate case is the client's text.
+    if (code === "22P02" && /surrogate/i.test(`${String(message)} ${String(detail)}`)) return true;
+  }
+  return false;
+}
