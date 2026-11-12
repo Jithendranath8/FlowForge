@@ -1,12 +1,18 @@
 /*
  * Request values PostgreSQL cannot store are the client's mistake and are refused with a
- * 400 before any handler runs. A NUL character is one: text and jsonb both reject it.
- * Left to the database it surfaces as a 500, which workers retry: a handler whose
+ * 400 before any handler runs:
+ *  - a NUL character: text and jsonb both reject it;
+ *  - a lone UTF-16 surrogate (invalid Unicode): jsonb rejects it, and text would silently
+ *    store a replacement character instead of what was sent.
+ * Left to the database these surface as a 500, which workers retry: a handler whose
  * output contained a NUL was re-run until its retries ran out.
  */
 
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
 function badText(s: string): string | null {
   if (s.includes("\u0000")) return "a NUL character (\\u0000)";
+  if (LONE_SURROGATE.test(s)) return "an unpaired UTF-16 surrogate (invalid Unicode)";
   return null;
 }
 

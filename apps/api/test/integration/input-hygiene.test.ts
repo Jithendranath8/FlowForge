@@ -6,9 +6,10 @@ import { TestClock, createApiKey, createTenant, makeContext, resetData, setupDat
 
 /*
  * Text that PostgreSQL cannot store must be refused as the client's mistake (400), never
- * surface as a 500: a NUL character is rejected by both text and jsonb. A 500 here is
- * worse than cosmetic: the SDK retries 5xx, so a handler whose output contains NUL was
- * re-run until its retries ran out, and the dead letter blamed a lost lease.
+ * surface as a 500: a NUL character (text and jsonb reject it) and a lone UTF-16
+ * surrogate (jsonb rejects it; text silently replaces it). A 500 here is worse than
+ * cosmetic: the SDK retries 5xx, so a handler whose output contains NUL was re-run until
+ * its retries ran out, and the dead letter blamed a lost lease.
  */
 
 let h: DbHandle;
@@ -18,6 +19,7 @@ let workerKey: string;
 
 const config = { MAX_PAYLOAD_BYTES: 256 * 1024, allowedOrigins: ["http://localhost:3000"], NODE_ENV: "test" as const, LOG_LEVEL: "silent" as const };
 const NUL = "\u0000";
+const LONE = "\ud800";
 
 beforeAll(async () => {
   h = await setupDatabase();
@@ -59,7 +61,10 @@ const expectRefused = (r: { statusCode: number; json: () => { error: { code: str
   expect(r.json().error.code).toBe("invalid_request");
 };
 
-describe.each([["a NUL character", NUL]])("text PostgreSQL cannot store: %s", (_name, bad) => {
+describe.each([
+  ["a NUL character", NUL],
+  ["a lone surrogate", LONE],
+])("text PostgreSQL cannot store: %s", (_name, bad) => {
   it("is refused in a run's input", async () => {
     await call("PUT", "/v1/workflows", key, definition);
     expectRefused(await call("POST", "/v1/workflows/job/runs", key, { input: { s: `a${bad}b` } }));
