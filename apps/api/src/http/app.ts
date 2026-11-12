@@ -5,11 +5,12 @@ import { sql } from "drizzle-orm";
 import Fastify, { type FastifyBaseLogger, type FastifyError, type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import type { Config } from "../config.js";
 import type { EngineContext } from "../engine/context.js";
-import { AppError, rateLimited } from "../errors.js";
+import { AppError, badRequest, rateLimited } from "../errors.js";
 import { EventFeed } from "../infra/feed.js";
 import { metrics } from "../infra/metrics.js";
 import { registerHttpTracing } from "../infra/tracing.js";
 import { hasScope, makeAuthenticate, type SessionResolver } from "./auth.js";
+import { findUnstorable } from "./hygiene.js";
 import { clientKey, FixedWindowLimiter, parseTrustProxy } from "./limits.js";
 import { authRoutes, makeSessionResolver, type AuthRuntime } from "./routes/auth.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
@@ -103,6 +104,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       reply.header("Access-Control-Allow-Headers", "content-type,authorization,x-csrf-token");
       return reply.code(204).send();
     }
+  });
+
+  // Text PostgreSQL cannot store is refused here (after authentication and body parsing),
+  // so it can never reach a query and come back as a 500.
+  app.addHook("preValidation", async (req) => {
+    const problem = findUnstorable(req.params, "path") ?? findUnstorable(req.query, "query") ?? findUnstorable(req.body, "body");
+    if (problem) throw badRequest(`Request ${problem}`);
   });
 
   app.setErrorHandler((err: FastifyError | AppError, req, reply) => {
